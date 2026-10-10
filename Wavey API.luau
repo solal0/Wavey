@@ -1,3 +1,5 @@
+-- It's just some functions for now but i'll make an actual document when I get there
+
 local UIS = game:GetService("UserInputService")
 
 UIS.InputBegan:Connect(function(input, gameProcessedEvent)
