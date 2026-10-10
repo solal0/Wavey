@@ -1,0 +1,8 @@
+- add a project ui where recent projects and a button to create new projects are
+- each project has it's own folder, assets folder, and wavey file.
+- actually, simply do so if user wants to import textures and assets he needs to make a project
+- add custom assets as meshparts and textures
+- undo doesn't bring back deleted instances
+
+cmake --build . --config Release
+.\Release\WaveyStudio.exe

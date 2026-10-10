@@ -1,0 +1,64 @@
+local UIS = game:GetService("UserInputService")
+
+UIS.InputBegan:Connect(function(input, gameProcessedEvent)
+    -- input is a table:
+    --   input.KeyCode       → number (SDL scancode, e.g. 44 for Space)
+    --   input.UserInputType → string ("Keyboard" or "MouseButton")
+    -- gameProcessedEvent    → boolean (always false for now, no GUI yet)
+
+    print(input.KeyCode)       -- e.g. 44
+    print(input.UserInputType) -- "Keyboard"
+
+    -- Compare against the KeyCode enum table:
+    if input.KeyCode == KeyCode.Space then
+        print("Space pressed!")
+    end
+    if input.KeyCode == KeyCode.W then
+        print("Walk forward!")
+    end
+    if input.UserInputType == "MouseButton" and input.KeyCode == KeyCode.Button1 then
+        print("Left click!")
+    end
+end)
+
+UIS.InputEnded:Connect(function(input, gameProcessedEvent)
+    -- Same structure as InputBegan
+end)
+
+-- Polling (works any time, not just in callbacks):
+if UIS:IsKeyDown(KeyCode.W) then
+    print("W is being held")
+end
+
+-- Mouse position (returns a table with X, Y):
+local mouse = UIS:GetMouseLocation()
+print(mouse.X, mouse.Y)
+
+
+
+
+local TweenService = game:GetService("TweenService")
+local part = workspace.RedBlock
+
+-- TweenInfo is just a plain Luau table (not a userdata):
+local tweenInfo = {
+    Time = 2.0,                          -- seconds
+    EasingStyle = EasingStyle.Quad,      -- Linear, Sine, Quad, Cubic
+    EasingDirection = EasingDirection.Out, -- In, Out, InOut
+    RepeatCount = 0,                     -- 0 = play once, N = replay N extra times
+    Reverses = true,                     -- after reaching goal, animate back
+    DelayTime = 0                        -- seconds before starting
+}
+
+-- Goals table: {propertyName = targetValue}
+local goals = {
+    Position = Vector3.new(0, 25, 0),
+    Transparency = 0.5,
+    Color = Color3.fromRGB(255, 100, 100),
+    Size = Vector3.new(10, 10, 10)
+}
+
+local tween = TweenService:Create(part, tweenInfo, goals)
+tween:Play()
+tween:Pause()
+tween:Cancel()

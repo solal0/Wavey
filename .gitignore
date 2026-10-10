@@ -1,0 +1,26 @@
+# ── CMake Build Directory ──
+/build/
+/out/
+
+# ── Visual Studio Local Settings ──
+.vs/
+*.user
+*.suo
+*.sln.docstates
+
+# ── Dependency Managers ──
+/vcpkg_installed/
+vcpkg-configuration.json
+
+# ── Wavey Engine Runtime Artifacts ──
+/autosaves/
+/build/Release/game.wavey
+/build/Release/WaveyPlayer.exe
+
+# ── Compiled Binaries ──
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.lib
+*.obj
