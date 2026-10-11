@@ -1,8 +1,23 @@
+KNOWN ISSUES
+- player forward and backward are inverted
+- undo doesn't bring back deleted instances, womp womp
+
+TODO
 - add a project ui where recent projects and a button to create new projects are
 - each project has it's own folder, assets folder, and wavey file.
 - actually, simply do so if user wants to import textures and assets he needs to make a project
 - add custom assets as meshparts and textures
-- undo doesn't bring back deleted instances
 
+MORE TODO
+- v0.10d Console & Debug HUD: Clear output on Play, in-game F9 console, F3 debug overlay, StarterGui:SetCoreGuiEnabled()
+- v0.12	Custom Textures & MeshParts: OBJ/glTF loader, texture upload pipeline, MeshPart class
+- v0.13	Full Character: 6-part body (Head/Torso/Arms/Legs), welds, Humanoid Luau API (:Move(), :Jump(), .Died), camera modes (Classic/Custom/Scriptable), mouse lock
+- v0.14	Advanced UI: UIListLayout, UIGridLayout, UIPadding, UICorner, UIStroke, TextBox, ScrollingFrame
+- v0.15	Audio: Sound playback via miniaudio/OpenAL, SoundService
+- v0.16	Lighting: PointLight/SpotLight/SurfaceLight actual rendering, shadows
+
+
+
+note to myself:
 cmake --build . --config Release
 .\Release\WaveyStudio.exe
