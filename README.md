@@ -19,13 +19,15 @@ and second of, all your assets need to comply roblox's rules and pass it's AI sy
 
 ## Manual Compiling
 
-Download, Install and add to PATH [CMake](https://cmake.org/download/) and then simply run those three commands:
+1. Download, Install and add to PATH [CMake](https://cmake.org/download/)
+2. Run these two commands at the root of the project (e.g. C:\Wavey):
 
 ```
-cd C:\\Wavey // or wherever wavey's root folder is
 cmake -B build -S . -DCMAKE\_TOOLCHAIN\_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
+
+3. Put the wavey folder (C:\Wavey\wavey) next to the build executable.
 
 ## Who made Wavey?
 

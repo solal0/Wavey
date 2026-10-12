@@ -1,6 +1,6 @@
 KNOWN ISSUES
-- (FIXED) undo doesn't bring back deleted instances — context-menu Delete now pushes to undo stack
-- (FIXED) scale snap used undeclared `primarySize`; now uses the live `size` so snap divides correctly by part size
+- undo no longer adds rotation, position and scale to it's stack
+- scale multiplies the current part scale when scaled up and scales the part down to 0 when scaled down
 
 TODO
 - add a project ui where recent projects and a button to create new projects are
@@ -13,7 +13,8 @@ TODO
 
 MORE TODO
 - v0.12: Custom Textures & MeshParts: OBJ/glTF loader, texture upload pipeline, MeshPart class
-- v0.13: Full Character: 6-part body (Head/Torso/Arms/Legs), welds, Humanoid Luau API (:Move(), :Jump(), .Died), camera modes (Classic/Custom/Scriptable), mouse lock
+(:Move(), :Jump(), .Died), camera modes (Classic/Custom/Scriptable), mouse lock
+- v0.13b: Body welds and real animations
 - v0.14: Advanced UI: UIListLayout, UIGridLayout, UIPadding, UICorner, UIStroke, TextBox, ScrollingFrame
 - v0.15: Audio: Sound playback via miniaudio/OpenAL, SoundService
 - v0.16: Lighting: PointLight/SpotLight/SurfaceLight actual rendering, shadows
@@ -39,6 +40,9 @@ DONE
 - v0.11c: UI Events: MouseButton1Click/Down/Up, MouseEnter/Leave, hit testing, input priority
 - v0.11d: UI Polish: Multi-font, text alignment, TextScaled, ZIndex, undo/redo, DataModel-aware autocomplete, script global, Enum.X.Y
 - v0.10d: Console & Debug HUD: Clear output on Play, in-game F9 console, F3 debug overlay, StarterGui:SetCoreGuiEnabled()
+- v0.13a: Full Character: 6-part body (Head/Torso/Arms/Legs), Humanoid Luau API 
 
 note to myself:
 cmake --build build --config Release
+git commit -m ""
+git push -u origin main --force
