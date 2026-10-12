@@ -1,6 +1,7 @@
 #include "LuauBridge.h"
 #include "Scheduler.h"
 #include "../engine/GameServices.h"
+#include "../engine/JoltPhysics.h"
 #include <unordered_map>
 #include <iostream>
 #include <cstring>
@@ -120,6 +121,64 @@ static int lua_InstanceGetService(lua_State* L) {
     return 1;
 }
 
+static int lua_HumanoidTakeDamage(lua_State* L) {
+    Instance* h = checkInstance(L, 1);
+    double amount = luaL_checknumber(L, 2);
+    if (h && h->HasProperty("Health")) {
+        auto hv = h->GetProperty("Health");
+        double cur = std::holds_alternative<double>(hv) ? std::get<double>(hv) : 100.0;
+        cur -= amount;
+        if (cur < 0) cur = 0;
+        h->SetProperty("Health", cur);
+    }
+    return 0;
+}
+
+static int lua_HumanoidMove(lua_State* L) {
+    Instance* h = checkInstance(L, 1);
+    // Second arg: Vector3 direction (userdata)
+    if (lua_isuserdata(L, 2)) {
+        Vector3* v = (Vector3*)lua_touserdata(L, 2);
+        if (v) h->SetProperty("MoveDirection", *v);
+    }
+    return 0;
+}
+
+static int lua_HumanoidJump(lua_State* L) {
+    Instance* h = checkInstance(L, 1);
+    h->SetProperty("Jumping", true);
+    // Actual jump impulse happens in UpdateCharacterController; this just sets the flag.
+    // For now, trigger by setting Jumping=true and letting the controller consume it.
+    extern bool g_CharGrounded;
+    extern Vector3 g_CharVelocity;
+    extern Instance* g_DevHumanoid;
+    if (h == g_DevHumanoid && g_CharGrounded) {
+        double jumpPower = 50.0;
+        if (h->HasProperty("JumpPower")) {
+            auto jv = h->GetProperty("JumpPower");
+            if (std::holds_alternative<double>(jv)) jumpPower = std::get<double>(jv);
+            else if (std::holds_alternative<int>(jv)) jumpPower = (double)std::get<int>(jv);
+        }
+        g_CharVelocity.Y = (float)jumpPower;
+        g_CharGrounded = false;
+    }
+    return 0;
+}
+
+static int lua_StarterGuiSetCoreGuiEnabled(lua_State* L) {
+    // arg 1 is the StarterGui instance, arg 2 is CoreGuiType, arg 3 is enabled bool
+    int guiType = (int)luaL_checkinteger(L, 2);
+    bool enabled = lua_toboolean(L, 3) != 0;
+
+    extern bool g_ConsoleEnabled;
+    extern bool g_DebugEnabled;
+
+    if (guiType == 0) g_ConsoleEnabled = enabled;      // Console
+    else if (guiType == 1) g_DebugEnabled = enabled;    // Debug
+
+    return 0;
+}
+
 static int lua_RunServiceHeartbeatConnect(lua_State* L) {
     luaL_checktype(L, 2, LUA_TFUNCTION);
     lua_pushvalue(L, 2);
@@ -191,6 +250,13 @@ static int lua_InstanceIndex(lua_State* L) {
     if (k == "IsA") { lua_pushcclosure(L, lua_InstanceIsA, "IsA", 0); return 1; }
     if (k == "WaitForChild") { lua_pushcclosure(L, lua_InstanceWaitForChild, "WaitForChild", 0); return 1; }
     if (k == "GetService") { lua_pushcclosure(L, lua_InstanceGetService, "GetService", 0); return 1; }
+    if (inst->ClassName == "StarterGui" && k == "SetCoreGuiEnabled") { lua_pushcclosure(L, lua_StarterGuiSetCoreGuiEnabled, "SetCoreGuiEnabled", 0); return 1; }
+    // Humanoid methods (Phase 13a)
+    if (inst->ClassName == "Humanoid") {
+        if (k == "TakeDamage") { lua_pushcclosure(L, lua_HumanoidTakeDamage, "TakeDamage", 0); return 1; }
+        if (k == "Move") { lua_pushcclosure(L, lua_HumanoidMove, "Move", 0); return 1; }
+        if (k == "Jump") { lua_pushcclosure(L, lua_HumanoidJump, "Jump", 0); return 1; }
+    }
 
     // RunService
     if (inst->ClassName == "RunService") {
@@ -231,6 +297,16 @@ static int lua_InstanceIndex(lua_State* L) {
     if (k == "Name") { lua_pushstring(L, inst->Name.c_str()); return 1; }
     if (k == "ClassName") { lua_pushstring(L, inst->ClassName.c_str()); return 1; }
     if (k == "Parent") { pushInstance(L, inst->GetParent()); return 1; }
+
+    // ── Virtual Properties: Jolt Velocity (Phase 13b) ──
+    if (k == "AssemblyLinearVelocity") {
+        pushVector3(L, g_JoltPhysics.GetLinearVelocity(inst));
+        return 1;
+    }
+    if (k == "AssemblyAngularVelocity") {
+        pushVector3(L, g_JoltPhysics.GetAngularVelocity(inst));
+        return 1;
+    }
 
     // DataModel Properties
     if (inst->HasProperty(k)) {
@@ -318,6 +394,20 @@ static int lua_InstanceNewIndex(lua_State* L) {
     }
     else if (type == LUA_TSTRING)
         inst->SetProperty(k, std::string(lua_tostring(L, 3)));
+    else if (k == "AssemblyLinearVelocity" && type == LUA_TUSERDATA) {
+        if (isUserdataOfType(L, 3, "WaveyVector3")) {
+            extern JoltPhysics g_JoltPhysics;
+            g_JoltPhysics.SetLinearVelocity(inst, *checkVector3(L, 3));
+        }
+        return 0;
+    }
+    else if (k == "AssemblyAngularVelocity" && type == LUA_TUSERDATA) {
+        if (isUserdataOfType(L, 3, "WaveyVector3")) {
+            extern JoltPhysics g_JoltPhysics;
+            g_JoltPhysics.SetAngularVelocity(inst, *checkVector3(L, 3));
+        }
+        return 0;
+    }
     else if (type == LUA_TUSERDATA) {
         if (isUserdataOfType(L, 3, "WaveyVector3"))
             inst->SetProperty(k, *checkVector3(L, 3));

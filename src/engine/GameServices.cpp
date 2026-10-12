@@ -385,5 +385,32 @@ void RegisterGameServices(lua_State* L) {
     lua_pushstring(L, "Bottom"); lua_setfield(L, -2, "Bottom");
     lua_setfield(L, -2, "TextYAlignment");
 
+    // CoreGuiType flat global
+    lua_newtable(L);
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "Console");
+    lua_pushinteger(L, 1); lua_setfield(L, -2, "Debug");
+    lua_setglobal(L, "CoreGuiType");
+
+    // Enum.CoreGuiType (Phase 10d)
+    lua_newtable(L);
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "Console");
+    lua_pushinteger(L, 1); lua_setfield(L, -2, "Debug");
+    lua_setfield(L, -2, "CoreGuiType");
+
+    // Enum.CameraType (Phase 13a)
+    lua_newtable(L);
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "Fixed");
+    lua_pushinteger(L, 1); lua_setfield(L, -2, "Custom");
+    lua_pushinteger(L, 2); lua_setfield(L, -2, "Scriptable");
+    lua_pushinteger(L, 3); lua_setfield(L, -2, "Classic");
+    lua_setfield(L, -2, "CameraType");
+
+    lua_newtable(L);
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "Fixed");
+    lua_pushinteger(L, 1); lua_setfield(L, -2, "Custom");
+    lua_pushinteger(L, 2); lua_setfield(L, -2, "Scriptable");
+    lua_pushinteger(L, 3); lua_setfield(L, -2, "Classic");
+    lua_setglobal(L, "CameraType");
+
     lua_setglobal(L, "Enum");
 }

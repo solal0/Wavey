@@ -5,6 +5,8 @@
 
 struct RigidBody {
     Vector3 velocity = {0, 0, 0};
+    Vector3 angularVelocity = {0, 0, 0}; // Degrees per second
+    float angularDamping = 0.97f;        // Per-frame damping (1.0 = no damping)
 };
 
 class Physics {

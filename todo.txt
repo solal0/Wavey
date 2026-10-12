@@ -1,8 +1,44 @@
+KNOWN ISSUES
+- (FIXED) undo doesn't bring back deleted instances — context-menu Delete now pushes to undo stack
+- (FIXED) scale snap used undeclared `primarySize`; now uses the live `size` so snap divides correctly by part size
+
+TODO
 - add a project ui where recent projects and a button to create new projects are
 - each project has it's own folder, assets folder, and wavey file.
 - actually, simply do so if user wants to import textures and assets he needs to make a project
 - add custom assets as meshparts and textures
-- undo doesn't bring back deleted instances
+- add client/server, multiplayer with local and public join access
+- copy specific lines in the output
+- script errors should be clickable, open/focus the script's tab and set the cursor at the end of the problematic line
 
-cmake --build . --config Release
-.\Release\WaveyStudio.exe
+MORE TODO
+- v0.12: Custom Textures & MeshParts: OBJ/glTF loader, texture upload pipeline, MeshPart class
+- v0.13: Full Character: 6-part body (Head/Torso/Arms/Legs), welds, Humanoid Luau API (:Move(), :Jump(), .Died), camera modes (Classic/Custom/Scriptable), mouse lock
+- v0.14: Advanced UI: UIListLayout, UIGridLayout, UIPadding, UICorner, UIStroke, TextBox, ScrollingFrame
+- v0.15: Audio: Sound playback via miniaudio/OpenAL, SoundService
+- v0.16: Lighting: PointLight/SpotLight/SurfaceLight actual rendering, shadows
+
+DONE
+- v0.0: Skeleton: SDL2 window, Luau VM, ImGui dark theme, Output panel
+- v0.1: DataModel: Instance tree, properties, signals, parenting
+- v0.2: 3D Rendering: Parts, camera orbit, viewport FBO
+- v0.3: Editor: Selection, insert, delete, rename, duplicate, save/load .wavey
+- v0.4: Physics & Play Mode: Gravity, AABB collisions, F5/Shift+F5
+- v0.5: Scripting: Luau scripts, task.wait(), coroutine scheduler
+- v0.6: Game Services: UserInputService, TweenService, enums
+- v0.7: Build Pipeline: Standalone .exe output with DLLs and fonts
+- v0.8a: Object References: UIDs, ObjectValue, persistent refs, save/load
+- v0.8b: Player & Character: Dev player, HumanoidRootPart, WASD + jump, camera follow
+- v0.8c: Dockable Tools tab: Play/Stop, gizmo tools, Part spawner
+- v0.8d: Autocomplete: Per-tab learning, built-in list, snippets
+- v0.9: Transform Gizmos: ImGuizmo Move/Rotate/Scale with snap
+- v0.10a: Multi-select, Properties search, Shape/Material dropdowns
+- v0.10b: Camera CFrame tracking, FieldOfView sync
+- v0.11a: UI Core: UDim/UDim2 types, ScreenGui/Frame/TextLabel/TextButton/ImageLabel classes
+- v0.11b: UI Rendering: stb_truetype fonts, 2D orthographic shader, recursive layout
+- v0.11c: UI Events: MouseButton1Click/Down/Up, MouseEnter/Leave, hit testing, input priority
+- v0.11d: UI Polish: Multi-font, text alignment, TextScaled, ZIndex, undo/redo, DataModel-aware autocomplete, script global, Enum.X.Y
+- v0.10d: Console & Debug HUD: Clear output on Play, in-game F9 console, F3 debug overlay, StarterGui:SetCoreGuiEnabled()
+
+note to myself:
+cmake --build build --config Release

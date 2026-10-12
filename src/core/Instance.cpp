@@ -40,6 +40,9 @@ static void RegisterAllCoreClasses() {
     Instance::RegisterClass("Camera", [](Instance* c) {
         c->SetProperty("FieldOfView", 70.0);
         c->SetProperty("CFrame", CFrame(0, 10, 10));
+        c->SetProperty("Position", Vector3(0, 10, 10));
+        c->SetProperty("Orientation", Vector3(0, 0, 0));
+        c->SetProperty("CameraType", std::string("Custom"));
     });
 
     Instance::RegisterClass("StringValue", [](Instance* v) {
@@ -161,6 +164,10 @@ static void RegisterAllCoreClasses() {
         h->SetProperty("WalkSpeed", 16.0);
         h->SetProperty("JumpPower", 50.0);
         h->SetProperty("Jumping", false);
+        h->SetProperty("PlatformStand", false);
+        h->SetProperty("Sit", false);
+        h->SetProperty("MoveDirection", Vector3(0, 0, 0));
+        h->SetProperty("HipHeight", 2.0);
     });
 }
 

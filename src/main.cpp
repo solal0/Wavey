@@ -21,12 +21,15 @@
 #include "engine/GameServices.h"
 #include "scripting/Scheduler.h"
 #include "editor/Autocomplete.h"
+#include "engine/JoltPhysics.h"
 #include "ImGuizmo.h"
 
 #define NOMINMAX  // Prevents Windows.h from defining min and max macros
 #include <windows.h>
 #include <commdlg.h>
 #include <shlobj.h> // For SHBrowseForFolderA and SHGetPathFromIDListA
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 #include <unordered_map>
 #include <filesystem>
@@ -87,13 +90,20 @@ static SDL_Window* g_Window = nullptr;
 bool g_IsRunning = false;
 static Physics g_Physics;
 static std::unordered_map<Instance*, Vector3> g_SavedPositions;
+static std::unordered_map<Instance*, Vector3> g_SavedOrientations; // Added Phase 13b
 
 // ── Character Controller State ──
-static Instance* g_DevCharacter = nullptr;   // Dev's HumanoidRootPart
-static Instance* g_DevHumanoid = nullptr;    // Dev's Humanoid
-static Vector3 g_CharVelocity = {0, 0, 0};
-static bool g_CharGrounded = false;
-static float g_CharYaw = 0.0f;               // Character's facing direction (degrees)
+Instance* g_DevCharacter = nullptr;   // Dev's HumanoidRootPart
+Instance* g_DevHumanoid = nullptr;    // Dev's Humanoid
+Instance* g_DevCharacterModel = nullptr; // The Model containing everything
+Vector3 g_CharVelocity = {0, 0, 0};
+bool g_CharGrounded = false;
+float g_CharYaw = 0.0f;
+float g_WalkCycleTime = 0.0f;         // For procedural animation
+bool g_CharacterDead = false;
+float g_RespawnTimer = 0.0f;
+constexpr float RESPAWN_DELAY = 5.0f; // Moved to top
+Vector3 g_SpawnPoint = {0, 3, 0}; // Height accounts for HipHeight(2) + HRP half-height(1) + ground(0) + some drop buffer
 
 // ── Camera Save/Restore ──
 static Vector3 g_SavedCameraTarget = {0, 5, 0};
@@ -117,6 +127,19 @@ static bool g_SnapRotateEnabled = true;
 static float g_SnapMoveValue = 1.0f;    // Studs
 static float g_SnapRotateValue = 15.0f; // Degrees
 
+// ── Console & Debug HUD (Phase 10d) ──
+static bool g_ShowDebugHUD = false;
+static bool g_ShowConsole = false;
+static int g_ConsoleMaxLines = 50;     // How many lines the in-game console shows
+bool g_ConsoleEnabled = true;   // StarterGui can disable
+bool g_DebugEnabled = true;     // StarterGui can disable
+static float g_FPS = 0.0f;
+static int g_FrameCount = 0;
+static float g_FPSTimer = 0.0f;
+
+// ── Clipboard (Phase 13b) ──
+static std::vector<Instance*> g_Clipboard; // Stores cloned instances for paste
+
 // ── Tool & Toolbar State ──
 enum class EditorTool {
     Mouse,
@@ -138,7 +161,7 @@ static std::string g_PickingPropertyName = "";
 static Instance* g_HoveredUI = nullptr;
 static Instance* g_PressedUI = nullptr;
 
-// ── Matrix Composition / Decomposition Helpers for ImGuizmo ──
+// ── Column-Major 4x4 Matrix Mathematics (Phase 13b) ──
 static void BuildMatrix(const Vector3& pos, const Vector3& orient, const Vector3& size, float* matrix) {
     float rx = orient.X * 3.14159265f / 180.0f;
     float ry = orient.Y * 3.14159265f / 180.0f;
@@ -152,11 +175,49 @@ static void BuildMatrix(const Vector3& pos, const Vector3& orient, const Vector3
     float r10 = sx * sy * cz - cx * sz, r11 = sx * sy * sz + cx * cz, r12 = sx * cy;
     float r20 = cx * sy * cz + sx * sz, r21 = cx * sy * sz - sx * cz, r22 = cx * cy;
 
-    // Column-major matrix
     matrix[0] = r00 * size.X; matrix[4] = r10 * size.Y; matrix[8]  = r20 * size.Z; matrix[12] = pos.X;
     matrix[1] = r01 * size.X; matrix[5] = r11 * size.Y; matrix[9]  = r21 * size.Z; matrix[13] = pos.Y;
     matrix[2] = r02 * size.X; matrix[6] = r12 * size.Y; matrix[10] = r22 * size.Z; matrix[14] = pos.Z;
     matrix[3] = 0.0f;         matrix[7] = 0.0f;         matrix[11] = 0.0f;         matrix[15] = 1.0f;
+}
+
+static void MatrixMultiply(const float* A, const float* B, float* R) {
+    float T[16];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            T[r + c * 4] = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                T[r + c * 4] += A[r + k * 4] * B[k + c * 4];
+            }
+        }
+    }
+    memcpy(R, T, sizeof(T));
+}
+
+static bool MatrixInverse(const float* m, float* out) {
+    float inv[16];
+    inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+    inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+    inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+    inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+    inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]  - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+    inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]  + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+
+    float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+    if (fabsf(det) < 1e-10f) return false;
+    det = 1.0f / det;
+    for (int i = 0; i < 16; i++) out[i] = inv[i] * det;
+    return true;
 }
 
 // ── Helpers ──
@@ -377,100 +438,264 @@ static void DoSaveAs() {
     }
 }
 
-// ── Character Controller: processes WASD, jump, camera follow ──
+// Forward decl — character creation will be split out of DoPlay later; for now re-run inline
+void RespawnCharacter() {
+    Instance* playersSvc = g_GameRoot->FindFirstChild("Players");
+    Instance* workspaceSvc = g_GameRoot->FindFirstChild("Workspace");
+    if (!playersSvc || !workspaceSvc) return;
+
+    // Clean up remnants
+    if (auto* oldPlayer = playersSvc->FindFirstChild("Dev")) oldPlayer->Destroy();
+    if (auto* oldChar = workspaceSvc->FindFirstChild("Dev")) oldChar->Destroy();
+
+    Instance* devPlayer = Instance::Create("Player");
+    devPlayer->Name = "Dev";
+    devPlayer->SetParent(playersSvc);
+
+    Instance* devChar = Instance::Create("Model");
+    devChar->Name = "Dev";
+    devChar->SetParent(workspaceSvc);
+
+    Vector3 spawn = g_SpawnPoint;
+
+    Color3 torsoColor(
+        0.3f + (rand() % 70) / 100.0f,
+        0.3f + (rand() % 70) / 100.0f,
+        0.3f + (rand() % 70) / 100.0f
+    );
+    Color3 skinColor(0.95f, 0.87f, 0.65f);
+    Color3 legColor(0.25f, 0.25f, 0.28f);
+
+    auto makePart = [&](const std::string& name, Vector3 size, Vector3 relPos, Color3 color, double transparency, bool canCollide) {
+        Instance* p = Instance::Create("Part");
+        p->Name = name;
+        p->SetProperty("Size", size);
+        p->SetProperty("Position", Vector3(spawn.X + relPos.X, spawn.Y + relPos.Y, spawn.Z + relPos.Z));
+        p->SetProperty("Color", color);
+        p->SetProperty("Transparency", transparency);
+        p->SetProperty("Anchored", name == "HumanoidRootPart" ? false : true);
+        p->SetProperty("CanCollide", canCollide);
+        p->SetProperty("Shape", std::string("Block"));
+        p->SetParent(devChar);
+        return p;
+    };
+
+    Instance* hrp     = makePart("HumanoidRootPart", Vector3(2, 2, 1), Vector3(0, 0, 0), Color3(0.5f, 0.5f, 1.0f), 1.0, true);
+    makePart("Head",      Vector3(2, 1, 1), Vector3(0, 1.5f, 0), skinColor, 0.0, false);
+    makePart("Torso",     Vector3(2, 2, 1), Vector3(0, 0, 0),    torsoColor, 0.0, false);
+    makePart("Left Arm",  Vector3(1, 2, 1), Vector3(-1.5f, 0, 0), skinColor, 0.0, false);
+    makePart("Right Arm", Vector3(1, 2, 1), Vector3(1.5f, 0, 0),  skinColor, 0.0, false);
+    makePart("Left Leg",  Vector3(1, 2, 1), Vector3(-0.5f, -2.0f, 0), legColor, 0.0, false);
+    makePart("Right Leg", Vector3(1, 2, 1), Vector3(0.5f, -2.0f, 0), legColor, 0.0, false);
+
+    Instance* humanoid = Instance::Create("Humanoid");
+    humanoid->Name = "Humanoid";
+    humanoid->SetParent(devChar);
+
+    devPlayer->SetProperty("Character", devChar);
+
+    g_DevCharacter = hrp;
+    g_DevHumanoid = humanoid;
+    g_DevCharacterModel = devChar;
+    g_CharVelocity = {0, 0, 0};
+    g_CharYaw = g_Camera.Yaw;
+    g_WalkCycleTime = 0.0f;
+    g_CharacterDead = false;
+
+    g_OutputLog.push_back("[Game] Dev respawned.");
+}
+
 static void UpdateCharacterController(float dt) {
+    if (!g_DevCharacterModel || g_DevCharacterModel->IsDestroyed()) return;
+
+    // Handle death
+    if (g_CharacterDead) {
+        g_RespawnTimer -= dt;
+        if (g_RespawnTimer <= 0.0f) {
+            if (g_DevCharacterModel && !g_DevCharacterModel->IsDestroyed()) {
+                g_DevCharacterModel->Destroy();
+            }
+            g_DevCharacterModel = nullptr;
+            g_DevCharacter = nullptr;
+            g_DevHumanoid = nullptr;
+            g_CharacterDead = false;
+            RespawnCharacter();
+        }
+        return;
+    }
+
     if (!g_DevCharacter || g_DevCharacter->IsDestroyed()) return;
     if (!g_DevHumanoid || g_DevHumanoid->IsDestroyed()) return;
 
-    // Read walkspeed and jumppower from Humanoid properties
-    double walkSpeed = 16.0;
-    double jumpPower = 50.0;
-    if (g_DevHumanoid->HasProperty("WalkSpeed")) {
-        auto wv = g_DevHumanoid->GetProperty("WalkSpeed");
-        if (std::holds_alternative<double>(wv)) walkSpeed = std::get<double>(wv);
-        else if (std::holds_alternative<int>(wv)) walkSpeed = (double)std::get<int>(wv);
-    }
-    if (g_DevHumanoid->HasProperty("JumpPower")) {
-        auto jv = g_DevHumanoid->GetProperty("JumpPower");
-        if (std::holds_alternative<double>(jv)) jumpPower = std::get<double>(jv);
-        else if (std::holds_alternative<int>(jv)) jumpPower = (double)std::get<int>(jv);
-    }
+    double walkSpeed = GetProp<double>(g_DevHumanoid, "WalkSpeed", 16.0);
+    double jumpPower = GetProp<double>(g_DevHumanoid, "JumpPower", 50.0);
+    double health = GetProp<double>(g_DevHumanoid, "Health", 100.0);
+    bool platformStand = GetProp<bool>(g_DevHumanoid, "PlatformStand", false);
 
-    // Only accept movement input while the viewport has focus
-    bool allowInput = g_ViewportHovered || !g_ViewportHovered; // Always true during play; refined later
-    (void)allowInput;
+    if (health <= 0.0 && !g_CharacterDead) {
+        g_CharacterDead = true;
+        g_RespawnTimer = RESPAWN_DELAY;
+
+        // Detach visible limbs and unregister HRP
+        g_JoltPhysics.UnregisterPart(g_DevCharacter);
+        for (auto* child : g_DevCharacterModel->GetChildren()) {
+            if (!child->IsA("Part")) continue;
+            if (child->Name == "HumanoidRootPart") {
+                child->SetProperty("Anchored", true);
+                child->SetProperty("CanCollide", false);
+                continue;
+            }
+            child->SetProperty("Anchored", false);
+            child->SetProperty("CanCollide", true);
+            g_JoltPhysics.RegisterPart(child); // Let limbs fall with Jolt!
+        }
+        g_OutputLog.push_back("[Game] Dev died. Respawning in 5 seconds...");
+        return;
+    }
 
     // Read keyboard
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
     float forward = 0.0f, right = 0.0f;
-    if (keys[SDL_SCANCODE_W]) forward += 1.0f;
-    if (keys[SDL_SCANCODE_S]) forward -= 1.0f;
-    if (keys[SDL_SCANCODE_D]) right += 1.0f;
-    if (keys[SDL_SCANCODE_A]) right -= 1.0f;
+    if (!platformStand) {
+        if (keys[SDL_SCANCODE_W]) forward += 1.0f;
+        if (keys[SDL_SCANCODE_S]) forward -= 1.0f;
+        if (keys[SDL_SCANCODE_D]) right += 1.0f;
+        if (keys[SDL_SCANCODE_A]) right -= 1.0f;
+    }
 
-    // Normalize diagonal movement
     float mag = sqrtf(forward * forward + right * right);
     if (mag > 0.0f) { forward /= mag; right /= mag; }
 
-    // Camera yaw determines "forward" direction (ignore pitch for walking)
+    // Camera-relative movement vectors (FIXED: negated forward direction)
     float yawRad = g_Camera.Yaw * 3.14159265f / 180.0f;
-    float fwdX = sinf(yawRad);
-    float fwdZ = cosf(yawRad);
-    float rgtX = cosf(yawRad);
-    float rgtZ = -sinf(yawRad);
+    float fwdX = -sinf(yawRad), fwdZ = -cosf(yawRad);
+    float rgtX = cosf(yawRad), rgtZ = -sinf(yawRad);
 
-    // World-space move direction
     float moveX = fwdX * forward + rgtX * right;
     float moveZ = fwdZ * forward + rgtZ * right;
 
-    // Apply horizontal velocity (overrides existing horizontal velocity)
-    g_CharVelocity.X = moveX * (float)walkSpeed;
-    g_CharVelocity.Z = moveZ * (float)walkSpeed;
+    // Read current Jolt velocity
+    Vector3 velocity = g_JoltPhysics.GetLinearVelocity(g_DevCharacter);
+    
+    velocity.X = moveX * (float)walkSpeed;
+    velocity.Z = moveZ * (float)walkSpeed;
 
-    // Face the camera direction when moving
+    g_DevHumanoid->SetProperty("MoveDirection", Vector3(moveX, 0, moveZ));
+
+    // Face the movement direction (not camera direction)
     if (mag > 0.01f) {
-        g_CharYaw = g_Camera.Yaw;
+        float moveAngle = atan2f(moveX, moveZ) * 180.0f / 3.14159265f;
+        g_CharYaw = moveAngle;
     }
 
-    // Jump (Space) if grounded
-    if (keys[SDL_SCANCODE_SPACE] && g_CharGrounded) {
-        g_CharVelocity.Y = (float)jumpPower;
+    // Jolt-driven Ground Check
+    Vector3 pos = GetProp<Vector3>(g_DevCharacter, "Position", Vector3(0, 5, 0));
+    double hipHeight = GetProp<double>(g_DevHumanoid, "HipHeight", 2.0);
+    
+    // Standing height: center of HRP is at: groundY + 1 (HRP half-height) + HipHeight
+    float standingHeight = 1.0f + (float)hipHeight;
+
+    float raycastGroundY = 0.0f;
+    Vector3 dummyNormal;
+    
+    // Cast ray from HRP center straight down, ignoring our own body!
+    bool hitGround = g_JoltPhysics.Raycast(
+        pos, 
+        Vector3(0, -1, 0), 
+        standingHeight + 0.15f, 
+        raycastGroundY, 
+        dummyNormal,
+        g_DevCharacter // Ignored during raycast!
+    );
+
+    // Grounded only if the ground surface is directly under our feet
+    g_CharGrounded = hitGround && (pos.Y - raycastGroundY) <= (standingHeight + 0.15f);
+
+    // Read current linear velocity from Jolt (reusing existing variable)
+    velocity = g_JoltPhysics.GetLinearVelocity(g_DevCharacter);
+
+    // Set horizontal velocities (WASD)
+    velocity.X = moveX * (float)walkSpeed;
+    velocity.Z = moveZ * (float)walkSpeed;
+
+    // ── Jump Trigger (Space) ──
+    if (keys[SDL_SCANCODE_SPACE] && g_CharGrounded && !platformStand) {
+        velocity.Y = (float)jumpPower; // Apply upward impulse
         g_CharGrounded = false;
         g_DevHumanoid->SetProperty("Jumping", true);
-    }
-
-    // Apply gravity
-    g_CharVelocity.Y += Physics::GRAVITY * dt;
-
-    // Get current position
-    Vector3 pos(0, 5, 0);
-    if (g_DevCharacter->HasProperty("Position")) {
-        auto pv = g_DevCharacter->GetProperty("Position");
-        if (std::holds_alternative<Vector3>(pv)) pos = std::get<Vector3>(pv);
-    }
-
-    // Integrate position
-    pos.X += g_CharVelocity.X * dt;
-    pos.Y += g_CharVelocity.Y * dt;
-    pos.Z += g_CharVelocity.Z * dt;
-
-    // Simple ground check (character is 2 tall; its center is 1 above ground)
-    float groundY = Physics::GROUND_Y + 1.0f; // bottom of character at Physics::GROUND_Y
-    if (pos.Y < groundY) {
-        pos.Y = groundY;
-        if (g_CharVelocity.Y < 0) g_CharVelocity.Y = 0;
-        g_CharGrounded = true;
-        g_DevHumanoid->SetProperty("Jumping", false);
     } else {
-        g_CharGrounded = false;
+        // PRESERVE Jolt's vertical velocity! This lets gravity run at full speed.
+        g_DevHumanoid->SetProperty("Jumping", !g_CharGrounded);
     }
 
-    // Write back position and orientation
-    g_DevCharacter->SetProperty("Position", pos);
+    // Pass velocities back to Jolt
+    g_JoltPhysics.SetLinearVelocity(g_DevCharacter, velocity);
+
+    // Also force-set Jolt body position so it doesn't drift
+    if (g_CharGrounded) {
+        g_JoltPhysics.SetLinearVelocity(g_DevCharacter, Vector3(velocity.X, 0, velocity.Z));
+    }
+
+    // Update orientation
     g_DevCharacter->SetProperty("Orientation", Vector3(0, g_CharYaw, 0));
 
-    // ── Camera follow: orbit around the character ──
-    g_Camera.Target = Vector3(pos.X, pos.Y + 2.0f, pos.Z);
+    // ── Procedural animation ──
+    bool isMoving = (mag > 0.01f);
+    bool isAirborne = !g_CharGrounded;
+
+    if (isMoving && !isAirborne) {
+        g_WalkCycleTime += dt * (float)walkSpeed * 0.4f;
+    } else {
+        if (g_WalkCycleTime > 0.001f) g_WalkCycleTime *= 0.85f;
+        else g_WalkCycleTime = 0.0f;
+    }
+
+    float swing = sinf(g_WalkCycleTime) * 30.0f;
+
+    float yawR = g_CharYaw * 3.14159265f / 180.0f;
+    float cs = cosf(yawR), sn = sinf(yawR);
+    auto rotateXZ = [&](float x, float z) -> Vector3 {
+        return Vector3(x * cs + z * sn, 0, -x * sn + z * cs);
+    };
+
+    // Keep cosmetic limbs welded to HRP
+    for (auto* child : g_DevCharacterModel->GetChildren()) {
+        if (!child->IsA("Part") || child->Name == "HumanoidRootPart") continue;
+
+        Vector3 localOffset(0, 0, 0);
+        Vector3 extraRot(0, g_CharYaw, 0);
+
+        if (child->Name == "Head") {
+            localOffset = Vector3(0, 1.5f, 0);
+        } else if (child->Name == "Torso") {
+            localOffset = Vector3(0, 0, 0);
+        } else if (child->Name == "Left Arm") {
+            Vector3 r = rotateXZ(-1.5f, 0);
+            localOffset = Vector3(r.X, 0, r.Z);
+            if (!isAirborne) extraRot.X = -swing;
+            else extraRot.X = -20.0f;
+        } else if (child->Name == "Right Arm") {
+            Vector3 r = rotateXZ(1.5f, 0);
+            localOffset = Vector3(r.X, 0, r.Z);
+            if (!isAirborne) extraRot.X = swing;
+            else extraRot.X = -20.0f;
+        } else if (child->Name == "Left Leg") {
+            Vector3 r = rotateXZ(-0.5f, 0);
+            localOffset = Vector3(r.X, -2.0f, r.Z);
+            if (!isAirborne) extraRot.X = swing;
+            else extraRot.X = 0.0f;
+        } else if (child->Name == "Right Leg") {
+            Vector3 r = rotateXZ(0.5f, 0);
+            localOffset = Vector3(r.X, -2.0f, r.Z);
+            if (!isAirborne) extraRot.X = -swing;
+            else extraRot.X = 0.0f;
+        }
+
+        child->SetProperty("Position", pos + localOffset);
+        child->SetProperty("Orientation", extraRot);
+    }
+
+    g_Camera.Target = Vector3(pos.X, pos.Y + 1.0f, pos.Z);
 }
 
 static void DoPlay() {
@@ -480,8 +705,13 @@ static void DoPlay() {
     // Force focus to Scene tab for one frame
     g_ScriptEditor.forceFocusTab = 0;
 
-    // Save all Part positions so we can restore on Stop
+    // Clear output on Play (Phase 10d)
+    g_OutputLog.clear();
+    g_OutputLog.push_back("[Play] Entering Play mode (F5)");
+
+    // Save all Part positions and orientations so we can restore on Stop
     g_SavedPositions.clear();
+    g_SavedOrientations.clear();
     auto descendants = g_GameRoot->GetDescendants();
     for (auto* inst : descendants) {
         if (inst->IsA("Part") && !inst->IsDestroyed()) {
@@ -489,6 +719,11 @@ static void DoPlay() {
                 auto pv = inst->GetProperty("Position");
                 if (std::holds_alternative<Vector3>(pv))
                     g_SavedPositions[inst] = std::get<Vector3>(pv);
+            }
+            if (inst->HasProperty("Orientation")) {
+                auto ov = inst->GetProperty("Orientation");
+                if (std::holds_alternative<Vector3>(ov))
+                    g_SavedOrientations[inst] = std::get<Vector3>(ov);
             }
         }
     }
@@ -503,11 +738,10 @@ static void DoPlay() {
     g_SavedCameraYaw = g_Camera.Yaw;
     g_SavedCameraPitch = g_Camera.Pitch;
 
-    // ── Create Dev Player & Character ──
+    // ── Create Dev Player & Full 6-Part Character (Phase 13a) ──
     Instance* playersSvc = g_GameRoot->FindFirstChild("Players");
     Instance* workspaceSvc = g_GameRoot->FindFirstChild("Workspace");
     if (playersSvc && workspaceSvc) {
-        // Clean up any pre-existing "Dev" entries from loaded place files
         if (auto* oldPlayer = playersSvc->FindFirstChild("Dev")) oldPlayer->Destroy();
         if (auto* oldChar = workspaceSvc->FindFirstChild("Dev")) oldChar->Destroy();
 
@@ -516,21 +750,57 @@ static void DoPlay() {
         devPlayer->Name = "Dev";
         devPlayer->SetParent(playersSvc);
 
-        // Character Model containing HumanoidRootPart + Humanoid
+        // Character Model
         Instance* devChar = Instance::Create("Model");
         devChar->Name = "Dev";
         devChar->SetParent(workspaceSvc);
 
-        // HumanoidRootPart (the visible body cube)
+        Vector3 spawn = g_SpawnPoint;
+
+        // Random torso color (chosen once per spawn)
+        Color3 torsoColor(
+            0.3f + (rand() % 70) / 100.0f,
+            0.3f + (rand() % 70) / 100.0f,
+            0.3f + (rand() % 70) / 100.0f
+        );
+
+        // Skin tone (pale yellow)
+        Color3 skinColor(0.95f, 0.87f, 0.65f);
+        // Dark grey for legs
+        Color3 legColor(0.25f, 0.25f, 0.28f);
+
+        // HumanoidRootPart (invisible driver, 2x2x1)
         Instance* hrp = Instance::Create("Part");
         hrp->Name = "HumanoidRootPart";
         hrp->SetProperty("Size", Vector3(2, 2, 1));
-        hrp->SetProperty("Position", Vector3(0, 5, 0));
-        hrp->SetProperty("Color", Color3(0.3f, 0.6f, 1.0f));
-        hrp->SetProperty("Anchored", false); // Must be unanchored so controller moves it
+        hrp->SetProperty("Position", spawn);
+        hrp->SetProperty("Color", Color3(0.5f, 0.5f, 1.0f));
+        hrp->SetProperty("Transparency", 1.0); // Invisible
+        hrp->SetProperty("Anchored", false);
         hrp->SetProperty("CanCollide", true);
         hrp->SetProperty("Shape", std::string("Block"));
         hrp->SetParent(devChar);
+
+        auto makePart = [&](const std::string& name, Vector3 size, Vector3 relPos, Color3 color, double transparency, bool canCollide, bool anchored) {
+            Instance* p = Instance::Create("Part");
+            p->Name = name;
+            p->SetProperty("Size", size);
+            p->SetProperty("Position", Vector3(spawn.X + relPos.X, spawn.Y + relPos.Y, spawn.Z + relPos.Z));
+            p->SetProperty("Color", color);
+            p->SetProperty("Transparency", transparency);
+            p->SetProperty("Anchored", anchored);
+            p->SetProperty("CanCollide", canCollide);
+            p->SetProperty("Shape", std::string("Block"));
+            p->SetParent(devChar);
+            return p;
+        };
+
+        makePart("Head",      Vector3(2, 1, 1), Vector3(0, 1.5f, 0), skinColor, 0.0, false, true);
+        makePart("Torso",     Vector3(2, 2, 1), Vector3(0, 0, 0),    torsoColor, 0.0, false, true);
+        makePart("Left Arm",  Vector3(1, 2, 1), Vector3(-1.5f, 0, 0), skinColor, 0.0, false, true);
+        makePart("Right Arm", Vector3(1, 2, 1), Vector3(1.5f, 0, 0),  skinColor, 0.0, false, true);
+        makePart("Left Leg",  Vector3(1, 2, 1), Vector3(-0.5f, -2.0f, 0), legColor, 0.0, false, true);
+        makePart("Right Leg", Vector3(1, 2, 1), Vector3(0.5f, -2.0f, 0), legColor, 0.0, false, true);
 
         // Humanoid
         Instance* humanoid = Instance::Create("Humanoid");
@@ -540,14 +810,18 @@ static void DoPlay() {
         // Link player → character
         devPlayer->SetProperty("Character", devChar);
 
-        // Store refs for controller
+        // Store refs
         g_DevCharacter = hrp;
         g_DevHumanoid = humanoid;
+        g_DevCharacterModel = devChar;
         g_CharVelocity = {0, 0, 0};
         g_CharYaw = 0.0f;
+        g_WalkCycleTime = 0.0f;
+        g_CharacterDead = false;
+        g_RespawnTimer = 0.0f;
 
-        // Position camera behind character
-        g_Camera.Target = Vector3(0, 6, 0);
+        // Position camera behind character (Custom mode)
+        g_Camera.Target = Vector3(spawn.X, spawn.Y + 1.0f, spawn.Z);
         g_Camera.Distance = 15.0f;
         g_Camera.Pitch = 15.0f;
         g_Camera.Yaw = 0.0f;
@@ -577,6 +851,10 @@ static void DoPlay() {
 static void DoStop() {
     if (!g_IsRunning) return;
     g_IsRunning = false;
+    g_ShowConsole = false;
+    g_ShowDebugHUD = false;
+
+    g_JoltPhysics.ClearAll();
 
     // ── Clean up Dev Player & Character ──
     Instance* playersSvc = g_GameRoot->FindFirstChild("Players");
@@ -591,7 +869,11 @@ static void DoStop() {
     }
     g_DevCharacter = nullptr;
     g_DevHumanoid = nullptr;
+    g_DevCharacterModel = nullptr;
     g_CharVelocity = {0, 0, 0};
+    g_WalkCycleTime = 0.0f;
+    g_CharacterDead = false;
+    g_RespawnTimer = 0.0f;
 
     // ── Restore camera state ──
     g_Camera.Target = g_SavedCameraTarget;
@@ -599,13 +881,19 @@ static void DoStop() {
     g_Camera.Yaw = g_SavedCameraYaw;
     g_Camera.Pitch = g_SavedCameraPitch;
 
-    // Restore all saved positions
+    // Restore all saved positions and orientations
     for (auto& [inst, pos] : g_SavedPositions) {
         if (inst && !inst->IsDestroyed()) {
             inst->SetProperty("Position", pos);
         }
     }
+    for (auto& [inst, orient] : g_SavedOrientations) {
+        if (inst && !inst->IsDestroyed()) {
+            inst->SetProperty("Orientation", orient);
+        }
+    }
     g_SavedPositions.clear();
+    g_SavedOrientations.clear();
     g_Physics.Reset();
     LuauBridge::ClearCallbacks();
     g_Scheduler.Clear();
@@ -804,29 +1092,36 @@ static void RenderInstanceTree(Instance* inst) {
     // Row Interaction Queries (Must run IMMEDIATELY after TreeNodeEx)
     // ═══════════════════════════════════════════════════════
     
-    // A. Single/Multi Click to Select (Picker Aware)
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-        if (g_PickingHostInstance != nullptr) {
-            // Assign reference to clicked instance! (with undo)
-            auto oldVal = g_PickingHostInstance->HasProperty(g_PickingPropertyName)
-                            ? g_PickingHostInstance->GetProperty(g_PickingPropertyName)
-                            : Instance::PropertyValue{(Instance*)nullptr};
-            g_PickingHostInstance->SetProperty(g_PickingPropertyName, inst);
-            g_Undo.PushPropertyChange(g_PickingHostInstance, g_PickingPropertyName, oldVal, Instance::PropertyValue{inst});
-            g_PickingHostInstance = nullptr;
-            g_PickingPropertyName = "";
-            MarkDirty();
-        } else {
-            ImGuiIO& sio = ImGui::GetIO();
-            if (sio.KeyShift && g_Editor.Selected) {
-                g_Editor.SelectRange(g_Editor.Selected, inst, g_GameRoot);
-            } else if (sio.KeyCtrl) {
-                g_Editor.AddToSelection(inst);
+    // ── Viewport Click-to-Select (Only in Editor Mode, and only when 3D Viewport is active) ──
+    if (!standaloneMode && g_ScriptEditor.activeTab == 0 && g_ViewportHovered 
+        && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemHovered() && !ImGuizmo::IsOver()
+        && !g_HoveredUI) {
+        
+        ImGuiIO& sio = ImGui::GetIO();
+        Instance* workspace = g_GameRoot->FindFirstChild("Workspace");
+        
+        // 1. Cast Ray to find clicked Part
+        Instance* hit = g_Editor.Raycast(
+            sio.MousePos.x, sio.MousePos.y,
+            g_ViewportScreenPos.x, g_ViewportScreenPos.y,
+            g_ViewportSize.x, g_ViewportSize.y,
+            g_Camera, workspace ? workspace : g_GameRoot
+        );
+
+        // 2. Process Selection (Shift / Ctrl Aware)
+        if (hit) {
+            if (sio.KeyShift || sio.KeyCtrl) {
+                g_Editor.AddToSelection(hit);
             } else {
-                g_Editor.Select(inst);
+                g_Editor.Select(hit);
             }
-            g_SelectedInstance = g_Editor.Selected;
+        } else {
+            // Clicking empty space clears selection (unless Shift/Ctrl is held)
+            if (!sio.KeyShift && !sio.KeyCtrl) {
+                g_Editor.ClearSelection();
+            }
         }
+        g_SelectedInstance = g_Editor.Selected;
     }
 
     // B. Double Click to Open Script
@@ -899,18 +1194,47 @@ static void RenderInstanceTree(Instance* inst) {
             g_FocusRename = true;
             if (!showProperties) showProperties = true;
         }
-        if (ImGui::MenuItem("Duplicate")) {
+        if (ImGui::MenuItem("Copy", "Ctrl+C")) {
+            for (auto* c : g_Clipboard) if (c) delete c;
+            g_Clipboard.clear();
+            for (Instance* s : g_Editor.SelectedList) {
+                if (s && !s->IsDestroyed()) g_Clipboard.push_back(s->Clone());
+            }
+        }
+        if (ImGui::MenuItem("Paste", "Ctrl+V", false, !g_Clipboard.empty())) {
+            for (Instance* c : g_Clipboard) {
+                if (c) {
+                    Instance* pasted = c->Clone();
+                    pasted->SetParent(inst);
+                    g_Editor.Select(pasted);
+                    g_SelectedInstance = pasted;
+                    g_Undo.PushInsert(pasted);
+                }
+            }
+            MarkDirty();
+        }
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D")) {
             Instance* clone = inst->Clone();
-            clone->Name = inst->Name + " (Copy)";
+            clone->Name = inst->Name;
             clone->SetParent(inst->GetParent());
             g_Editor.Select(clone);
             g_SelectedInstance = clone;
+            g_Undo.PushInsert(clone);
             MarkDirty();
         }
         ImGui::Separator();
         if (!isProtected) {
             if (ImGui::MenuItem("Delete", "Del")) {
                 g_Editor.Select(inst);
+                // Push undo BEFORE destroying so deleted instances can be restored
+                for (Instance* s : g_Editor.SelectedList) {
+                    if (s && !s->IsDestroyed() && s->ClassName != "DataModel") {
+                        bool isService = s->GetParent() && s->GetParent()->ClassName == "DataModel";
+                        if (!isService) {
+                            g_Undo.PushDelete(s, s->GetParent());
+                        }
+                    }
+                }
                 g_Editor.DeleteSelected();
                 g_SelectedInstance = nullptr;
                 MarkDirty();
@@ -1270,6 +1594,7 @@ int main(int argc, char* argv[]) {
         style.Colors[ImGuiCol_DockingPreview] = ImVec4(0.35f, 0.55f, 0.90f, 0.70f);
 
         g_Renderer.Init();
+        g_JoltPhysics.Init();
 
         char exePath[MAX_PATH];
         GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -1458,10 +1783,73 @@ int main(int argc, char* argv[]) {
                         if (ok) MarkDirty();
                     }
 
+                    // Ctrl+C = Copy, Ctrl+V = Paste, Ctrl+D = Duplicate
+                    if (ctrlModifier && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+                        // Copy: clone selection into clipboard
+                        for (auto* c : g_Clipboard) if (c) delete c;
+                        g_Clipboard.clear();
+                        for (Instance* s : g_Editor.SelectedList) {
+                            if (s && !s->IsDestroyed()) {
+                                g_Clipboard.push_back(s->Clone());
+                            }
+                        }
+                        if (!g_Clipboard.empty()) {
+                            g_OutputLog.push_back("[Edit] Copied " + std::to_string(g_Clipboard.size()) + " instance(s)");
+                        }
+                    }
+                    if (ctrlModifier && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+                        // Paste: parent cloned clipboard into same parent as original
+                        if (!g_Clipboard.empty()) {
+                            g_Editor.ClearSelection();
+                            for (Instance* c : g_Clipboard) {
+                                if (c) {
+                                    Instance* pasted = c->Clone();
+                                    pasted->Name = c->Name;
+                                    // Find a reasonable parent (workspace or first selected's parent)
+                                    Instance* parent = g_GameRoot->FindFirstChild("Workspace");
+                                    pasted->SetParent(parent);
+                                    g_Editor.AddToSelection(pasted);
+                                    g_Undo.PushInsert(pasted);
+                                }
+                            }
+                            g_SelectedInstance = g_Editor.Selected;
+                            MarkDirty();
+                            g_OutputLog.push_back("[Edit] Pasted " + std::to_string(g_Clipboard.size()) + " instance(s)");
+                        }
+                    }
+                    if (ctrlModifier && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+                        // Duplicate: instant clone of selection into same parent
+                        std::vector<Instance*> dupes;
+                        for (Instance* s : g_Editor.SelectedList) {
+                            if (s && !s->IsDestroyed()) {
+                                Instance* dupe = s->Clone();
+                                dupe->Name = s->Name;
+                                dupe->SetParent(s->GetParent());
+                                dupes.push_back(dupe);
+                                g_Undo.PushInsert(dupe);
+                            }
+                        }
+                        g_Editor.ClearSelection();
+                        for (Instance* d : dupes) g_Editor.AddToSelection(d);
+                        g_SelectedInstance = g_Editor.Selected;
+                        MarkDirty();
+                        if (!dupes.empty()) {
+                            g_OutputLog.push_back("[Edit] Duplicated " + std::to_string(dupes.size()) + " instance(s)");
+                        }
+                    }
+
                     // Cancel object picking on Escape
                     if (keys[SDL_SCANCODE_ESCAPE]) {
                         g_PickingHostInstance = nullptr;
                         g_PickingPropertyName = "";
+                    }
+
+                    // F9 = Toggle Console, F3 = Toggle Debug HUD (Phase 10d)
+                    if (ImGui::IsKeyPressed(ImGuiKey_F9, false) && g_ConsoleEnabled && g_IsRunning) {
+                        g_ShowConsole = !g_ShowConsole;
+                    }
+                    if (ImGui::IsKeyPressed(ImGuiKey_F3, false) && g_DebugEnabled && g_IsRunning) {
+                        g_ShowDebugHUD = !g_ShowDebugHUD;
                     }
 
                     // F5 = Play, Shift+F5 = Stop
@@ -1522,7 +1910,6 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // ── Viewport Click-to-Select (Only in Editor Mode, and only when 3D Viewport is active) ──
             if (!standaloneMode && g_ScriptEditor.activeTab == 0 && g_ViewportHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemHovered() && !ImGuizmo::IsOver() && !g_HoveredUI) {
                 Instance* workspace = g_GameRoot->FindFirstChild("Workspace");
                 Instance* hit = g_Editor.Raycast(
@@ -1531,8 +1918,17 @@ int main(int argc, char* argv[]) {
                     g_ViewportSize.x, g_ViewportSize.y,
                     g_Camera, workspace ? workspace : g_GameRoot
                 );
-                g_Editor.Select(hit);
-                g_SelectedInstance = hit;
+
+                // Respect modifier keys for multi-selection (same as Explorer tree)
+                ImGuiIO& sio = ImGui::GetIO();
+                if (sio.KeyShift && g_Editor.Selected && hit) {
+                    g_Editor.SelectRange(g_Editor.Selected, hit, g_GameRoot);
+                } else if (sio.KeyCtrl && hit) {
+                    g_Editor.AddToSelection(hit);
+                } else {
+                    g_Editor.Select(hit);
+                }
+                g_SelectedInstance = g_Editor.Selected;
             }
 
             // ── Script Auto-Save (every 30 seconds) ──
@@ -1568,11 +1964,43 @@ int main(int argc, char* argv[]) {
                 float dt = now - g_LastFrameTime;
                 g_LastFrameTime = now;
 
+                // FPS counter (Phase 10d)
+                g_FrameCount++;
+                g_FPSTimer += dt;
+                if (g_FPSTimer >= 1.0f) {
+                    g_FPS = (float)g_FrameCount / g_FPSTimer;
+                    g_FrameCount = 0;
+                    g_FPSTimer = 0.0f;
+                }
+
                 if (dt > 0.05f) dt = 0.05f;
 
-                // Step physics (only simulate Workspace descendants)
-                Instance* workspace = g_GameRoot->FindFirstChild("Workspace");
-                g_Physics.Step(workspace ? workspace : g_GameRoot, dt);
+                // Register workspace parts with Jolt (excluding player character parts)
+                {
+                    Instance* ws = g_GameRoot->FindFirstChild("Workspace");
+                    if (ws) {
+                        for (auto* desc : ws->GetDescendants()) {
+                            if (desc->IsA("Part") && !desc->IsDestroyed()) {
+                                // Check if this part is a cosmetic character limb
+                                bool isCosmeticLimb = false;
+                                Instance* p = desc->GetParent();
+                                while (p) {
+                                    if (p->ClassName == "Model" && p->Name == "Dev") {
+                                        if (desc->Name != "HumanoidRootPart") {
+                                            isCosmeticLimb = true;
+                                        }
+                                        break;
+                                    }
+                                    p = p->GetParent();
+                                }
+                                if (isCosmeticLimb) continue; // Skip cosmetic limbs, but register HRP!
+
+                                g_JoltPhysics.RegisterPart(desc);
+                            }
+                        }
+                    }
+                }
+                g_JoltPhysics.Step(dt);
                 UpdateCharacterController(dt);
                 LuauBridge::FireHeartbeat(dt);
                 g_Scheduler.Update(now);
@@ -1860,6 +2288,15 @@ int main(int argc, char* argv[]) {
                                             if (ImGui::Combo("##font", &current, fonts, 4)) {
                                                 newVal = std::string(fonts[current]); changed = true;
                                             }
+                                        } else if (propName == "CameraType") {
+                                            static const char* camTypes[] = { "Fixed", "Custom", "Scriptable", "Classic" };
+                                            int current = 1; // Default = Custom
+                                            for (int i = 0; i < 4; i++) {
+                                                if (s == camTypes[i]) { current = i; break; }
+                                            }
+                                            if (ImGui::Combo("##camtype", &current, camTypes, 4)) {
+                                                newVal = std::string(camTypes[current]); changed = true;
+                                            }
                                         } else if (propName == "TextXAlignment") {
                                             static const char* aligns[] = { "Left", "Center", "Right" };
                                             int current = 1;
@@ -2027,8 +2464,7 @@ int main(int argc, char* argv[]) {
 
                                     // Click-to-reveal: show the primary's value if user clicks
                                     char placeholder[64];
-                                    snprintf(placeholder, sizeof(placeholder),
-                                        "<mixed - click to edit as %s>", primary->Name.c_str());
+                                    snprintf(placeholder, sizeof(placeholder), "<mixed - click to edit as %s>", primary->Name.c_str());
                                     char empty[1] = { '\0' };
                                     if (ImGui::InputTextWithHint("##mixed", placeholder, empty, 0,
                                         ImGuiInputTextFlags_EnterReturnsTrue)) {
@@ -2091,391 +2527,413 @@ int main(int argc, char* argv[]) {
                     ImGui::End();
                 }
 
-                // ── Viewport + Script Tabs (Perfectly Balanced) ──
-                if (showViewport) {
-                    ImGui::Begin("Viewport", nullptr); // Safely removed close-on-undock pointer
+            // ── Viewport + Script Tabs (Guaranteed, Debug-Equipped Version) ──
+            if (showViewport) {
+                ImGui::Begin("Viewport", nullptr);
 
-                    // Tab bar
-                    if (ImGui::BeginTabBar("ViewportTabs", ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_AutoSelectNewTabs)) {
+                if (ImGui::BeginTabBar("ViewportTabs", ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_AutoSelectNewTabs)) {
 
-                        // ── Tab 0: 3D Viewport ──
-                        bool viewportOpen = true;
-                        ImGuiTabItemFlags sceneTabFlags = 0;
-                        if (g_ScriptEditor.forceFocusTab == 0) {
-                            sceneTabFlags |= ImGuiTabItemFlags_SetSelected;
-                            g_ScriptEditor.forceFocusTab = -1;
-                        }
-                        if (ImGui::BeginTabItem("Scene", &viewportOpen, sceneTabFlags)) {
-                            // Detect switching to viewport tab → save all
-                            if (g_ScriptEditor.lastActiveTab != 0) {
-                                g_ScriptEditor.SaveAll();
-                                g_ScriptEditor.lastActiveTab = 0;
-                            }
-                            g_ScriptEditor.activeTab = 0;
-                            g_ViewportHovered = ImGui::IsWindowHovered();
-                            g_ViewportSize = ImGui::GetContentRegionAvail();
-                            g_ViewportScreenPos = ImGui::GetCursorScreenPos();
-
-                            if (g_ViewportHovered) {
-                                if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
-                                    g_Camera.Yaw -= io.MouseDelta.x * 0.3f;
-                                    g_Camera.Pitch += io.MouseDelta.y * 0.3f;
-                                    g_Camera.Pitch = (std::max)(-89.0f, (std::min)(g_Camera.Pitch, 89.0f));
-                                }
-                                if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-                                    float right[3], up[3];
-                                    g_Camera.GetRightVector(right);
-                                    g_Camera.GetUpVector(up);
-                                    float speed = g_Camera.Distance * 0.003f;
-                                    g_Camera.Target.X -= (right[0] * io.MouseDelta.x - up[0] * io.MouseDelta.y) * speed;
-                                    g_Camera.Target.Y -= (right[1] * io.MouseDelta.x - up[1] * io.MouseDelta.y) * speed;
-                                    g_Camera.Target.Z -= (right[2] * io.MouseDelta.x - up[2] * io.MouseDelta.y) * speed;
-                                }
-                                if (io.MouseWheel != 0) {
-                                    g_Camera.Distance -= io.MouseWheel * 3.0f;
-                                    g_Camera.Distance = (std::max)(1.0f, (std::min)(g_Camera.Distance, 500.0f));
-                                }
-                            }
-
-                            if (g_ViewportSize.x > 10 && g_ViewportSize.y > 10) {
-                                // Render 3D Scene FBO
-                                ImGui::Image((ImTextureID)(intptr_t)g_Renderer.GetSceneTexture(), g_ViewportSize, ImVec2(0, 1), ImVec2(1, 0));
-
-                                // ── 3D Gizmo Manipulation ──
-                                if (g_SelectedInstance && g_SelectedInstance->IsA("Part") && !g_SelectedInstance->IsDestroyed() && g_CurrentTool != EditorTool::Mouse) {
-                                    Instance* part = g_SelectedInstance;
-
-                                    // 1. Configure ImGuizmo bounds matching this panel
-                                    ImGuizmo::SetDrawlist();
-                                    ImGuizmo::SetRect(g_ViewportScreenPos.x, g_ViewportScreenPos.y, g_ViewportSize.x, g_ViewportSize.y);
-
-                                    // 2. Fetch View and Projection matrices from active camera
-                                    float view[16], proj[16];
-                                    g_Camera.GetViewMatrix(view);
-                                    g_Camera.GetProjectionMatrix(g_ViewportSize.x / g_ViewportSize.y, proj);
-
-                                    // 3. Compose Part's current transform matrix
-                                    Vector3 pos = GetProp<Vector3>(part, "Position", Vector3(0, 0, 0));
-                                    Vector3 orient = GetProp<Vector3>(part, "Orientation", Vector3(0, 0, 0));
-                                    Vector3 size = GetProp<Vector3>(part, "Size", Vector3(4, 1, 2));
-
-                                    float matrix[16];
-                                    BuildMatrix(pos, orient, size, matrix);
-
-                                    // 4. Determine Active Operation
-                                    ImGuizmo::OPERATION op = ImGuizmo::TRANSLATE;
-                                    if (g_CurrentTool == EditorTool::Move) op = ImGuizmo::TRANSLATE;
-                                    else if (g_CurrentTool == EditorTool::Rotate) op = ImGuizmo::ROTATE;
-                                    else if (g_CurrentTool == EditorTool::Scale) op = ImGuizmo::SCALE;
-
-                                    // Capture start state BEFORE ImGuizmo mutates the matrix
-                                    static bool wasUsingGizmo = false;
-                                    static Vector3 gizmoStartPos, gizmoStartOrient, gizmoStartSize;
-
-                                    if (!wasUsingGizmo && !ImGuizmo::IsUsing()) {
-                                        // Not dragging — continuously snapshot in case drag starts next frame
-                                        gizmoStartPos = GetProp<Vector3>(part, "Position", Vector3());
-                                        gizmoStartOrient = GetProp<Vector3>(part, "Orientation", Vector3());
-                                        gizmoStartSize = GetProp<Vector3>(part, "Size", Vector3(4,1,2));
-                                    }
-
-                                    // 5. Let the user manipulate the matrix live (with optional snap)
-                                    float snapValues[3] = { 0, 0, 0 };
-                                    float* snapPtr = nullptr;
-                                    if (op == ImGuizmo::TRANSLATE && g_SnapMoveEnabled) {
-                                        snapValues[0] = snapValues[1] = snapValues[2] = g_SnapMoveValue;
-                                        snapPtr = snapValues;
-                                    } else if (op == ImGuizmo::ROTATE && g_SnapRotateEnabled) {
-                                        snapValues[0] = snapValues[1] = snapValues[2] = g_SnapRotateValue;
-                                        snapPtr = snapValues;
-                                    } else if (op == ImGuizmo::SCALE && g_SnapMoveEnabled) {
-                                        snapValues[0] = snapValues[1] = snapValues[2] = g_SnapMoveValue;
-                                        snapPtr = snapValues;
-                                    }
-                                    ImGuizmo::Manipulate(view, proj, op, ImGuizmo::LOCAL, matrix, nullptr, snapPtr);
-
-                                    if (ImGuizmo::IsUsing()) {
-                                        wasUsingGizmo = true;
-
-                                        float outPos[3], outOrient[3], outSize[3];
-                                        ImGuizmo::DecomposeMatrixToComponents(matrix, outPos, outOrient, outSize);
-
-                                        part->SetProperty("Position", Vector3(outPos[0], outPos[1], outPos[2]));
-                                        part->SetProperty("Orientation", Vector3(outOrient[0], outOrient[1], outOrient[2]));
-
-                                        float sx = (std::max)(0.05f, outSize[0]);
-                                        float sy = (std::max)(0.05f, outSize[1]);
-                                        float sz = (std::max)(0.05f, outSize[2]);
-                                        part->SetProperty("Size", Vector3(sx, sy, sz));
-
-                                        MarkDirty();
-                                    } else if (wasUsingGizmo) {
-                                        // Just finished dragging — push undo entries ONLY for actually-changed properties
-                                        Vector3 endPos = GetProp<Vector3>(part, "Position", Vector3());
-                                        Vector3 endOrient = GetProp<Vector3>(part, "Orientation", Vector3());
-                                        Vector3 endSize = GetProp<Vector3>(part, "Size", Vector3(4,1,2));
-
-                                        auto vec3Diff = [](const Vector3& a, const Vector3& b) {
-                                            return a.X != b.X || a.Y != b.Y || a.Z != b.Z;
-                                        };
-
-                                        if (vec3Diff(gizmoStartPos, endPos))
-                                            g_Undo.PushPropertyChange(part, "Position", gizmoStartPos, endPos);
-                                        if (vec3Diff(gizmoStartOrient, endOrient))
-                                            g_Undo.PushPropertyChange(part, "Orientation", gizmoStartOrient, endOrient);
-                                        if (vec3Diff(gizmoStartSize, endSize))
-                                            g_Undo.PushPropertyChange(part, "Size", gizmoStartSize, endSize);
-
-                                        wasUsingGizmo = false;
-                                    }
-                                }
-                            }
-                            ImGui::EndTabItem(); // End Scene Tab
-                        }
-
-                        // ── Tabs 1+: Script Editors ──
-                        for (int i = 0; i < (int)g_ScriptEditor.tabs.size(); i++) {
-                            ScriptTab& tab = g_ScriptEditor.tabs[i];
-                            if (!tab.script || tab.script->IsDestroyed()) {
-                                g_ScriptEditor.CloseTab(i + 1);
-                                i--;
-                                continue;
-                            }
-
-                            std::string tabLabel = tab.script->Name + "##tab" + std::to_string(i);
-
-                            bool tabOpen = true;
-                            ImGuiTabItemFlags tabFlags = 0;
-                            if (g_ScriptEditor.forceFocusTab == i + 1) {
-                                tabFlags |= ImGuiTabItemFlags_SetSelected;
-                                g_ScriptEditor.forceFocusTab = -1; // Consume the flag
-                            }
-
-                            if (ImGui::BeginTabItem(tabLabel.c_str(), &tabOpen, tabFlags)) {
-                                int thisTabIndex = i + 1;
-
-                                // Save all when switching tabs
-                                if (g_ScriptEditor.lastActiveTab != thisTabIndex) {
-                                    g_ScriptEditor.SaveAll();
-                                    g_ScriptEditor.lastActiveTab = thisTabIndex;
-                                }
-                                g_ScriptEditor.activeTab = thisTabIndex;
-
-                                // Render the TextEditor (fills available space)
-                                if (tab.editor) {
-                                    // ── Define Shared Autocomplete Accept Logic ──
-                                    auto acceptSuggestion = [&](int idx) {
-                                        if (idx < 0 || idx >= (int)tab.autocomplete.suggestions.size()) return;
-                                        auto& entry = tab.autocomplete.suggestions[idx];
-                                        auto cursor = tab.editor->GetCursorPosition();
-                                        int prefixLen = (int)tab.autocomplete.currentPrefix.length();
-
-                                        // 1. Delete the typed prefix
-                                        if (prefixLen > 0 && cursor.mColumn >= prefixLen) {
-                                            TextEditor::Coordinates selStart(cursor.mLine, cursor.mColumn - prefixLen);
-                                            TextEditor::Coordinates selEnd(cursor.mLine, cursor.mColumn);
-                                            tab.editor->SetSelection(selStart, selEnd);
-                                            tab.editor->Delete();
-                                        }
-
-                                        // 2. Figure out what to insert and where cursor should go
-                                        std::string insertion;
-                                        int cursorOffset = 0;
-
-                                        if (!entry.snippet.empty()) {
-                                            insertion = entry.snippet;
-                                            cursorOffset = entry.cursorOffset;
-                                        } else if (entry.isFunction) {
-                                            insertion = entry.name + "()";
-                                            cursorOffset = 1;
-                                        } else {
-                                            insertion = entry.name;
-                                            cursorOffset = 0;
-                                        }
-
-                                        // 3. Insert the text
-                                        tab.editor->InsertText(insertion.c_str());
-
-                                        // 4. Move cursor back by offset
-                                        if (cursorOffset > 0) {
-                                            auto nc = tab.editor->GetCursorPosition();
-                                            tab.editor->SetCursorPosition(
-                                                TextEditor::Coordinates(nc.mLine, nc.mColumn - cursorOffset)
-                                            );
-                                        }
-
-                                        tab.autocomplete.Reset();
-                                    };
-
-                                    // ── Autocomplete Key Handling & Input Blocking ──
-                                    bool blockEditorKeysForFrame = false;
-
-                                    if (tab.autocomplete.visible && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
-                                        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
-                                            tab.autocomplete.selectedIndex++;
-                                            if (tab.autocomplete.selectedIndex >= (int)tab.autocomplete.suggestions.size())
-                                                tab.autocomplete.selectedIndex = 0;
-                                            blockEditorKeysForFrame = true;
-                                        }
-                                        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
-                                            tab.autocomplete.selectedIndex--;
-                                            if (tab.autocomplete.selectedIndex < 0)
-                                                tab.autocomplete.selectedIndex = (int)tab.autocomplete.suggestions.size() - 1;
-                                            blockEditorKeysForFrame = true;
-                                        }
-                                        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-                                            tab.autocomplete.Reset();
-                                            blockEditorKeysForFrame = true;
-                                        }
-
-                                        // Tab or Enter to accept
-                                        if (ImGui::IsKeyPressed(ImGuiKey_Tab) || ImGui::IsKeyPressed(ImGuiKey_Enter)) {
-                                            acceptSuggestion(tab.autocomplete.selectedIndex);
-                                            blockEditorKeysForFrame = true;
-                                            ImGui::GetIO().InputQueueCharacters.clear();
-                                        }
-                                    }
-
-                                    // Safely toggle the editor's key listener for this frame
-                                    tab.editor->SetHandleKeyboardInputs(!blockEditorKeysForFrame);
-
-                                    // ── Auto-pair brackets and quotes ──
-                                    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
-                                        ImGuiIO& eio = ImGui::GetIO();
-                                        for (ImWchar c : eio.InputQueueCharacters) {
-                                            const char* pair = nullptr;
-                                            switch (c) {
-                                                case '(': pair = ")"; break;
-                                                case '[': pair = "]"; break;
-                                                case '{': pair = "}"; break;
-                                                case '"': pair = "\""; break;
-                                                case '\'': pair = "'"; break;
-                                            }
-                                            if (pair) {
-                                                auto cursor = tab.editor->GetCursorPosition();
-                                                tab.editor->InsertText(pair);
-                                                tab.editor->SetCursorPosition(cursor);
-                                            }
-                                        }
-                                    }
-
-                                    // ── Render Editor ──
-                                    ImVec2 editorSize = ImGui::GetContentRegionAvail();
-                                    std::string editorId = "ScriptEditor##" + std::to_string(i);
-                                    tab.editor->Render(editorId.c_str(), editorSize, true);
-
-                                    // ── Autocomplete Popup (AFTER editor render) ──
-                                    if (tab.editor->IsTextChanged()) {
-                                        tab.autocomplete.RebuildLearnedWords(tab.editor->GetText());
-                                    }
-
-                                    // Extract current word prefix + chain context
-                                    {
-                                        auto cursor = tab.editor->GetCursorPosition();
-                                        std::string fullText = tab.editor->GetText();
-                                        std::string prefix = "";
-                                        std::string chainContext = ""; // e.g. "game.Workspace" when typing after a dot
-
-                                        std::vector<std::string> lines;
-                                        std::string line;
-                                        for (char c : fullText) {
-                                            if (c == '\n') { lines.push_back(line); line.clear(); }
-                                            else line += c;
-                                        }
-                                        lines.push_back(line);
-
-                                        if (cursor.mLine < (int)lines.size()) {
-                                            std::string& curLine = lines[cursor.mLine];
-                                            int col = (std::min)(cursor.mColumn, (int)curLine.length());
-
-                                            // Walk backward from cursor through [word chars + dots]
-                                            int start = col;
-                                            while (start > 0 && (isalnum(curLine[start - 1]) || curLine[start - 1] == '_' || curLine[start - 1] == '.')) {
-                                                start--;
-                                            }
-
-                                            if (start < col) {
-                                                std::string fullChain = curLine.substr(start, col - start);
-                                                // Split on last dot
-                                                size_t lastDot = fullChain.rfind('.');
-                                                if (lastDot != std::string::npos) {
-                                                    chainContext = fullChain.substr(0, lastDot);
-                                                    prefix = fullChain.substr(lastDot + 1);
-                                                } else {
-                                                    prefix = fullChain;
-                                                }
-                                            }
-                                        }
-
-                                        tab.autocomplete.Update(prefix, chainContext);
-                                    }
-
-                                    // Render popup
-                                    if (tab.autocomplete.visible) {
-                                        ImVec2 editorMin = ImGui::GetItemRectMin();
-                                        float charW = ImGui::CalcTextSize("M").x;
-                                        float lineH = ImGui::GetTextLineHeightWithSpacing();
-                                        auto cursor = tab.editor->GetCursorPosition();
-
-                                        float popupX = editorMin.x + 60 + cursor.mColumn * charW;
-                                        float popupY = editorMin.y + (cursor.mLine + 1) * lineH + 4;
-
-                                        ImGui::SetNextWindowPos(ImVec2(popupX, popupY));
-                                        ImGui::SetNextWindowSize(ImVec2(250, 0));
-                                        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.12f, 0.15f, 0.97f));
-                                        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.35f, 0.55f, 0.90f, 0.70f));
-                                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 4));
-
-                                        ImGuiWindowFlags popupFlags =
-                                            ImGuiWindowFlags_NoTitleBar |
-                                            ImGuiWindowFlags_NoResize |
-                                            ImGuiWindowFlags_NoMove |
-                                            ImGuiWindowFlags_NoDocking |
-                                            ImGuiWindowFlags_NoScrollbar |
-                                            ImGuiWindowFlags_AlwaysAutoResize |
-                                            ImGuiWindowFlags_NoFocusOnAppearing |
-                                            ImGuiWindowFlags_NoNav;
-
-                                        if (ImGui::Begin("##ACPopup", nullptr, popupFlags)) {
-                                            for (int j = 0; j < (int)tab.autocomplete.suggestions.size(); j++) {
-                                                auto& entry = tab.autocomplete.suggestions[j];
-                                                bool isSelected = (j == tab.autocomplete.selectedIndex);
-
-                                                if (isSelected) {
-                                                    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.25f, 0.45f, 0.80f, 1.0f));
-                                                }
-
-                                                std::string label = entry.name + (entry.isFunction ? "()" : "");
-                                                if (ImGui::Selectable(label.c_str(), isSelected)) {
-                                                    acceptSuggestion(j);
-                                                }
-
-                                                if (isSelected) {
-                                                    ImGui::PopStyleColor();
-                                                    if (ImGui::IsWindowAppearing()) ImGui::SetScrollHereY();
-                                                }
-                                            }
-                                        }
-                                        ImGui::End();
-                                        ImGui::PopStyleVar();
-                                        ImGui::PopStyleColor(2);
-                                    }
-                                }
-
-                                ImGui::EndTabItem(); // End Script Tab
-                            }
-
-                            if (!tabOpen) {
-                                g_ScriptEditor.CloseTab(i + 1);
-                                i--;
-                            }
-                        }
-
-                        ImGui::EndTabBar(); // End Tab Bar
+                    // ── Tab 0: 3D Viewport ──
+                    bool viewportOpen = true;
+                    ImGuiTabItemFlags sceneTabFlags = 0;
+                    if (g_ScriptEditor.forceFocusTab == 0) {
+                        sceneTabFlags |= ImGuiTabItemFlags_SetSelected;
+                        g_ScriptEditor.forceFocusTab = -1;
                     }
 
-                    ImGui::End(); // End Viewport Window
+                    if (ImGui::BeginTabItem("Scene", &viewportOpen, sceneTabFlags)) {
+                        if (g_ScriptEditor.lastActiveTab != 0) {
+                            g_ScriptEditor.SaveAll();
+                            g_ScriptEditor.lastActiveTab = 0;
+                        }
+                        g_ScriptEditor.activeTab = 0;
+                        g_ViewportHovered = ImGui::IsWindowHovered();
+                        g_ViewportSize = ImGui::GetContentRegionAvail();
+                        g_ViewportScreenPos = ImGui::GetCursorScreenPos();
+
+                        // Camera controls
+                        if (g_ViewportHovered) {
+                            if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+                                g_Camera.Yaw -= io.MouseDelta.x * 0.3f;
+                                g_Camera.Pitch += io.MouseDelta.y * 0.3f;
+                                g_Camera.Pitch = (std::max)(-89.0f, (std::min)(g_Camera.Pitch, 89.0f));
+                            }
+                            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+                                float right[3], up[3];
+                                g_Camera.GetRightVector(right);
+                                g_Camera.GetUpVector(up);
+                                float speed = g_Camera.Distance * 0.003f;
+                                g_Camera.Target.X -= (right[0] * io.MouseDelta.x - up[0] * io.MouseDelta.y) * speed;
+                                g_Camera.Target.Y -= (right[1] * io.MouseDelta.x - up[1] * io.MouseDelta.y) * speed;
+                                g_Camera.Target.Z -= (right[2] * io.MouseDelta.x - up[2] * io.MouseDelta.y) * speed;
+                            }
+                            if (io.MouseWheel != 0) {
+                                g_Camera.Distance -= io.MouseWheel * 3.0f;
+                                g_Camera.Distance = (std::max)(1.0f, (std::min)(g_Camera.Distance, 500.0f));
+                            }
+                        }
+
+                        if (g_ViewportSize.x > 10 && g_ViewportSize.y > 10) {
+                            // Render 3D Scene FBO
+                            ImGui::Image((ImTextureID)(intptr_t)g_Renderer.GetSceneTexture(), g_ViewportSize, ImVec2(0, 1), ImVec2(1, 0));
+
+                            // ── 3D Gizmo Manipulation ──
+                            if (g_SelectedInstance && g_SelectedInstance->IsA("Part") && !g_SelectedInstance->IsDestroyed() && g_CurrentTool != EditorTool::Mouse) {
+                                Instance* part = g_SelectedInstance;
+
+                                ImGuizmo::SetDrawlist();
+                                ImGuizmo::SetRect(g_ViewportScreenPos.x, g_ViewportScreenPos.y, g_ViewportSize.x, g_ViewportSize.y);
+
+                                float view[16], proj[16];
+                                g_Camera.GetViewMatrix(view);
+                                g_Camera.GetProjectionMatrix(g_ViewportSize.x / g_ViewportSize.y, proj);
+
+                                ImGuizmo::OPERATION op = ImGuizmo::TRANSLATE;
+                                if (g_CurrentTool == EditorTool::Move) op = ImGuizmo::TRANSLATE;
+                                else if (g_CurrentTool == EditorTool::Rotate) op = ImGuizmo::ROTATE;
+                                else if (g_CurrentTool == EditorTool::Scale) op = ImGuizmo::SCALE;
+
+                                // ── Static Caching of Drag Start State ──
+                                static bool wasUsingGizmo = false;
+                                static float gizmoStart[16];
+                                static float gizmoCurrent[16];
+                                static Vector3 startPos;
+                                static Vector3 startOrient;
+                                static Vector3 startSize;
+
+                                Vector3 pos = GetProp<Vector3>(part, "Position", Vector3(0, 0, 0));
+                                Vector3 orient = GetProp<Vector3>(part, "Orientation", Vector3(0, 0, 0));
+                                Vector3 size = GetProp<Vector3>(part, "Size", Vector3(4, 1, 2));
+
+                                bool isUsingNow = ImGuizmo::IsUsing();
+
+                                if (!wasUsingGizmo && isUsingNow) {
+                                    // DRAG STARTED! Capture frozen start state
+                                    startPos = pos;
+                                    startOrient = orient;
+                                    startSize = size;
+
+                                    BuildMatrix(pos, orient, size, gizmoStart);
+                                    memcpy(gizmoCurrent, gizmoStart, sizeof(gizmoStart));
+                                    wasUsingGizmo = true;
+
+                                    std::cout << "[Gizmo Debug] Drag Start! Part: " << part->Name 
+                                              << " | Size: (" << size.X << ", " << size.Y << ", " << size.Z << ")" << std::endl;
+                                }
+
+                                if (!isUsingNow) {
+                                    // IDLE: Continuously sync the matrix from the part's properties
+                                    BuildMatrix(pos, orient, size, gizmoCurrent);
+                                    wasUsingGizmo = false;
+                                }
+
+                                // Apply Snapping (Phase 11d)
+                                float snapValues[3] = { 0, 0, 0 };
+                                float* snapPtr = nullptr;
+                                if (op == ImGuizmo::TRANSLATE && g_SnapMoveEnabled) {
+                                    snapValues[0] = snapValues[1] = snapValues[2] = g_SnapMoveValue;
+                                    snapPtr = snapValues;
+                                } else if (op == ImGuizmo::ROTATE && g_SnapRotateEnabled) {
+                                    float radSnap = g_SnapRotateValue * 3.14159265f / 180.0f;
+                                    snapValues[0] = snapValues[1] = snapValues[2] = radSnap;
+                                    snapPtr = snapValues;
+                                } else if (op == ImGuizmo::SCALE && g_SnapMoveEnabled) {
+                                    // Scale snap must be divided by the starting size to prevent giant jumps!
+                                    snapValues[0] = g_SnapMoveValue / (size.X > 0.001f ? size.X : 1.0f);
+                                    snapValues[1] = g_SnapMoveValue / (size.Y > 0.001f ? size.Y : 1.0f);
+                                    snapValues[2] = g_SnapMoveValue / (size.Z > 0.001f ? size.Z : 1.0f);
+                                    snapPtr = snapValues;
+                                }
+
+                                // Let the user manipulate the gizmo
+                                ImGuizmo::Manipulate(view, proj, op, ImGuizmo::LOCAL, gizmoCurrent, nullptr, snapPtr);
+
+                                if (isUsingNow) {
+                                    float outPos[3], outOrient[3], outSize[3];
+                                    ImGuizmo::DecomposeMatrixToComponents(gizmoCurrent, outPos, outOrient, outSize);
+
+                                    if (op == ImGuizmo::SCALE) {
+                                        // Recover the true sign in case user scaled past zero into negatives
+                                        float signX = (gizmoCurrent[0]*gizmoStart[0] + gizmoCurrent[1]*gizmoStart[1] + gizmoCurrent[2]*gizmoStart[2]) < 0.0f ? -1.0f : 1.0f;
+                                        float signY = (gizmoCurrent[4]*gizmoStart[4] + gizmoCurrent[5]*gizmoStart[5] + gizmoCurrent[6]*gizmoStart[6]) < 0.0f ? -1.0f : 1.0f;
+                                        float signZ = (gizmoCurrent[8]*gizmoStart[8] + gizmoCurrent[9]*gizmoStart[9] + gizmoCurrent[10]*gizmoStart[10]) < 0.0f ? -1.0f : 1.0f;
+
+                                        float finalSizeX = outSize[0] * signX;
+                                        float finalSizeY = outSize[1] * signY;
+                                        float finalSizeZ = outSize[2] * signZ;
+
+                                        part->SetProperty("Size", Vector3(finalSizeX, finalSizeY, finalSizeZ));
+                                        
+                                        // Keep position centered during scaling (two-sided scaling)
+                                        part->SetProperty("Position", startPos);
+
+                                        std::cout << "[Gizmo Debug] Scaling Live! outSize: (" 
+                                                  << outSize[0] << ", " << outSize[1] << ", " << outSize[2] 
+                                                  << ") | Signs: (" << signX << ", " << signY << ", " << signZ 
+                                                  << ") | Final: (" << finalSizeX << ", " << finalSizeY << ", " << finalSizeZ << ")" << std::endl;
+                                    } else {
+                                        part->SetProperty("Position", Vector3(outPos[0], outPos[1], outPos[2]));
+                                        part->SetProperty("Orientation", Vector3(outOrient[0], outOrient[1], outOrient[2]));
+                                    }
+                                    MarkDirty();
+                                } else if (wasUsingGizmo) {
+                                    // Drag ended: push undo states for actually-changed properties
+                                    Vector3 endPos = GetProp<Vector3>(part, "Position", Vector3());
+                                    Vector3 endOrient = GetProp<Vector3>(part, "Orientation", Vector3());
+                                    Vector3 endSize = GetProp<Vector3>(part, "Size", Vector3(4,1,2));
+
+                                    auto vec3Diff = [](const Vector3& a, const Vector3& b) {
+                                        return fabsf(a.X - b.X) > 0.001f || fabsf(a.Y - b.Y) > 0.001f || fabsf(a.Z - b.Z) > 0.001f;
+                                    };
+
+                                    if (vec3Diff(startPos, endPos))
+                                        g_Undo.PushPropertyChange(part, "Position", startPos, endPos);
+                                    if (vec3Diff(startOrient, endOrient))
+                                        g_Undo.PushPropertyChange(part, "Orientation", startOrient, endOrient);
+                                    if (vec3Diff(startSize, endSize))
+                                        g_Undo.PushPropertyChange(part, "Size", startSize, endSize);
+
+                                    std::cout << "[Gizmo Debug] Drag End! Final Size: (" 
+                                              << endSize.X << ", " << endSize.Y << ", " << endSize.Z << ")" << std::endl;
+                                    wasUsingGizmo = false;
+                                }
+                            }
+                        }
+                        ImGui::EndTabItem(); // End Scene Tab
+                    }
+
+                    // ── Tabs 1+: Script Editors ──
+                    for (int i = 0; i < (int)g_ScriptEditor.tabs.size(); i++) {
+                        ScriptTab& tab = g_ScriptEditor.tabs[i];
+                        if (!tab.script || tab.script->IsDestroyed()) {
+                            g_ScriptEditor.CloseTab(i + 1);
+                            i--;
+                            continue;
+                        }
+
+                        std::string tabLabel = tab.script->Name + "##tab" + std::to_string(i);
+
+                        bool tabOpen = true;
+                        ImGuiTabItemFlags tabFlags = 0;
+                        if (g_ScriptEditor.forceFocusTab == i + 1) {
+                            tabFlags |= ImGuiTabItemFlags_SetSelected;
+                            g_ScriptEditor.forceFocusTab = -1;
+                        }
+
+                        if (ImGui::BeginTabItem(tabLabel.c_str(), &tabOpen, tabFlags)) {
+                            int thisTabIndex = i + 1;
+
+                            if (g_ScriptEditor.lastActiveTab != thisTabIndex) {
+                                g_ScriptEditor.SaveAll();
+                                g_ScriptEditor.lastActiveTab = thisTabIndex;
+                            }
+                            g_ScriptEditor.activeTab = thisTabIndex;
+
+                            if (tab.editor) {
+                                // ── Define Shared Autocomplete Accept Logic ──
+                                auto acceptSuggestion = [&](int idx) {
+                                    if (idx < 0 || idx >= (int)tab.autocomplete.suggestions.size()) return;
+                                    auto& entry = tab.autocomplete.suggestions[idx];
+                                    auto cursor = tab.editor->GetCursorPosition();
+                                    int prefixLen = (int)tab.autocomplete.currentPrefix.length();
+
+                                    // 1. Delete the typed prefix
+                                    if (prefixLen > 0 && cursor.mColumn >= prefixLen) {
+                                        TextEditor::Coordinates selStart(cursor.mLine, cursor.mColumn - prefixLen);
+                                        TextEditor::Coordinates selEnd(cursor.mLine, cursor.mColumn);
+                                        tab.editor->SetSelection(selStart, selEnd);
+                                        tab.editor->Delete();
+                                    }
+
+                                    // 2. Figure out what to insert and where cursor should go
+                                    std::string insertion;
+                                    int cursorOffset = 0;
+
+                                        if (!entry.snippet.empty()) {
+                                        insertion = entry.snippet;
+                                        cursorOffset = entry.cursorOffset;
+                                    } else if (entry.isFunction) {
+                                        insertion = entry.name + "()";
+                                        cursorOffset = 1;
+                                    } else {
+                                        insertion = entry.name;
+                                        cursorOffset = 0;
+                                    }
+
+                                    // 3. Insert the text
+                                    tab.editor->InsertText(insertion.c_str());
+
+                                    // 4. Move cursor back by offset
+                                    if (cursorOffset > 0) {
+                                        auto nc = tab.editor->GetCursorPosition();
+                                        tab.editor->SetCursorPosition(
+                                            TextEditor::Coordinates(nc.mLine, nc.mColumn - cursorOffset)
+                                        );
+                                    }
+
+                                    tab.autocomplete.Reset();
+                                };
+
+                                // Autocomplete Key Handling
+                                bool blockEditorKeysForFrame = false;
+
+                                if (tab.autocomplete.visible && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+                                    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+                                        tab.autocomplete.selectedIndex++;
+                                        if (tab.autocomplete.selectedIndex >= (int)tab.autocomplete.suggestions.size())
+                                            tab.autocomplete.selectedIndex = 0;
+                                        blockEditorKeysForFrame = true;
+                                    }
+                                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+                                        tab.autocomplete.selectedIndex--;
+                                        if (tab.autocomplete.selectedIndex < 0)
+                                            tab.autocomplete.selectedIndex = (int)tab.autocomplete.suggestions.size() - 1;
+                                        blockEditorKeysForFrame = true;
+                                    }
+                                    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                                        tab.autocomplete.Reset();
+                                        blockEditorKeysForFrame = true;
+                                    }
+
+                                    if (ImGui::IsKeyPressed(ImGuiKey_Tab) || ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+                                        acceptSuggestion(tab.autocomplete.selectedIndex);
+                                        blockEditorKeysForFrame = true;
+                                        ImGui::GetIO().InputQueueCharacters.clear();
+                                    }
+                                }
+
+                                tab.editor->SetHandleKeyboardInputs(!blockEditorKeysForFrame);
+
+                                // Auto-pair brackets and quotes
+                                if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+                                    ImGuiIO& eio = ImGui::GetIO();
+                                    for (ImWchar c : eio.InputQueueCharacters) {
+                                        const char* pair = nullptr;
+                                        switch (c) {
+                                            case '(': pair = ")"; break;
+                                            case '[': pair = "]"; break;
+                                            case '{': pair = "}"; break;
+                                            case '"': pair = "\""; break;
+                                            case '\'': pair = "'"; break;
+                                        }
+                                        if (pair) {
+                                            auto cursor = tab.editor->GetCursorPosition();
+                                            tab.editor->InsertText(pair);
+                                            tab.editor->SetCursorPosition(cursor);
+                                        }
+                                    }
+                                }
+
+                                ImVec2 editorSize = ImGui::GetContentRegionAvail();
+                                std::string editorId = "ScriptEditor##" + std::to_string(i);
+                                tab.editor->Render(editorId.c_str(), editorSize, true);
+
+                                // Autocomplete Popup
+                                if (tab.editor->IsTextChanged()) {
+                                    tab.autocomplete.RebuildLearnedWords(tab.editor->GetText());
+                                }
+
+                                {
+                                    auto cursor = tab.editor->GetCursorPosition();
+                                    std::string fullText = tab.editor->GetText();
+                                    std::string prefix = "";
+                                    std::string chainContext = "";
+
+                                    std::vector<std::string> lines;
+                                    std::string line;
+                                    for (char c : fullText) {
+                                        if (c == '\n') { lines.push_back(line); line.clear(); }
+                                        else line += c;
+                                    }
+                                    lines.push_back(line);
+
+                                    if (cursor.mLine < (int)lines.size()) {
+                                        std::string& curLine = lines[cursor.mLine];
+                                        int col = (std::min)(cursor.mColumn, (int)curLine.length());
+                                        int start = col;
+                                        while (start > 0 && (isalnum(curLine[start - 1]) || curLine[start - 1] == '_' || curLine[start - 1] == '.')) {
+                                            start--;
+                                        }
+                                        if (start < col) {
+                                            std::string fullChain = curLine.substr(start, col - start);
+                                            size_t lastDot = fullChain.rfind('.');
+                                            if (lastDot != std::string::npos) {
+                                                chainContext = fullChain.substr(0, lastDot);
+                                                prefix = fullChain.substr(lastDot + 1);
+                                            } else {
+                                                prefix = fullChain;
+                                            }
+                                        }
+                                    }
+
+                                    tab.autocomplete.Update(prefix, chainContext);
+                                }
+
+                                if (tab.autocomplete.visible) {
+                                    ImVec2 editorMin = ImGui::GetItemRectMin();
+                                    float charW = ImGui::CalcTextSize("M").x;
+                                    float lineH = ImGui::GetTextLineHeightWithSpacing();
+                                    auto cursor = tab.editor->GetCursorPosition();
+
+                                    float popupX = editorMin.x + 60 + cursor.mColumn * charW;
+                                    float popupY = editorMin.y + (cursor.mLine + 1) * lineH + 4;
+
+                                    ImGui::SetNextWindowPos(ImVec2(popupX, popupY));
+                                    ImGui::SetNextWindowSize(ImVec2(250, 0));
+                                    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.12f, 0.15f, 0.97f));
+                                    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.35f, 0.55f, 0.90f, 0.70f));
+                                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 4));
+
+                                    ImGuiWindowFlags popupFlags =
+                                        ImGuiWindowFlags_NoTitleBar |
+                                        ImGuiWindowFlags_NoResize |
+                                        ImGuiWindowFlags_NoMove |
+                                        ImGuiWindowFlags_NoDocking |
+                                        ImGuiWindowFlags_NoScrollbar |
+                                        ImGuiWindowFlags_AlwaysAutoResize |
+                                        ImGuiWindowFlags_NoFocusOnAppearing |
+                                        ImGuiWindowFlags_NoNav;
+
+                                    if (ImGui::Begin("##ACPopup", nullptr, popupFlags)) {
+                                        for (int j = 0; j < (int)tab.autocomplete.suggestions.size(); j++) {
+                                            auto& entry = tab.autocomplete.suggestions[j];
+                                            bool isSelected = (j == tab.autocomplete.selectedIndex);
+
+                                            if (isSelected) {
+                                                ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.25f, 0.45f, 0.80f, 1.0f));
+                                            }
+
+                                            std::string label = entry.name + (entry.isFunction ? "()" : "");
+                                            if (ImGui::Selectable(label.c_str(), isSelected)) {
+                                                acceptSuggestion(j);
+                                            }
+
+                                            if (isSelected) {
+                                                ImGui::PopStyleColor();
+                                                if (ImGui::IsWindowAppearing()) ImGui::SetScrollHereY();
+                                            }
+                                        }
+                                    }
+                                    ImGui::End();
+                                    ImGui::PopStyleVar();
+                                    ImGui::PopStyleColor(2);
+                                }
+                            }
+
+                            ImGui::EndTabItem(); // End Script Tab
+                        }
+
+                        if (!tabOpen) {
+                            g_ScriptEditor.CloseTab(i + 1);
+                            i--;
+                        }
+                    }
+
+                    ImGui::EndTabBar(); // End Tab Bar
                 }
+
+                ImGui::End(); // End Viewport Window
+            }
 
                 // ── Tools Panel (dockable like any other panel) ──
                 if (showTools) {
@@ -2735,6 +3193,10 @@ int main(int argc, char* argv[]) {
                                 if (std::holds_alternative<double>(tv)) transp = (float)std::get<double>(tv);
                                 else if (std::holds_alternative<int>(tv)) transp = (float)std::get<int>(tv);
                             }
+                            
+                            // If 100% transparent (like HRP), skip rendering completely to avoid depth-buffer glitches!
+                            if (transp >= 1.0f) continue;
+
                             Vector3 orient = GetProp<Vector3>(inst, "Orientation", Vector3(0, 0, 0));
                             std::string shape = GetProp<std::string>(inst, "Shape", std::string("Block"));
                             g_Renderer.DrawPart(pos, size, orient, color, transp, shape);
@@ -2769,6 +3231,142 @@ int main(int argc, char* argv[]) {
                         }
                     }
 
+                    // ── In-Game Console Overlay (F9) ──
+                        if (g_ShowConsole && g_IsRunning) {
+                        float consoleH = (float)vpH * 0.35f;
+                        float consoleY = (float)vpH - consoleH;
+
+                        // Semi-transparent black background
+                        g_Renderer.DrawRect2D(0, consoleY, (float)vpW, consoleH, Color3(0, 0, 0), 0.3f);
+
+                        // Title bar
+                        g_Renderer.DrawRect2D(0, consoleY, (float)vpW, 28, Color3(0.1f, 0.1f, 0.15f), 0.1f);
+                        g_Renderer.DrawText2D("Console", 10, consoleY + 5, 16, Color3(0.8f, 0.8f, 0.8f), 0.0f);
+
+                        // Print recent log lines (bottom-up, newest at bottom)
+                        int startIdx = (std::max)(0, (int)g_OutputLog.size() - g_ConsoleMaxLines);
+                        float lineH = 18.0f;
+                        float textY = consoleY + 32.0f;
+
+                        for (int i = startIdx; i < (int)g_OutputLog.size(); i++) {
+                            if (textY + lineH > (float)vpH) break;
+
+                            Color3 lineColor(0.85f, 0.85f, 0.85f);
+                            const auto& line = g_OutputLog[i];
+                            if (line.find("ERROR") != std::string::npos)
+                                lineColor = Color3(1.0f, 0.3f, 0.3f);
+                            else if (line.find("[Play]") != std::string::npos || line.find("[Stop]") != std::string::npos)
+                                lineColor = Color3(0.3f, 0.8f, 1.0f);
+                            else if (line.find("[Autosave]") != std::string::npos)
+                                lineColor = Color3(0.75f, 0.5f, 1.0f);
+                            else if (line.find("[Save]") != std::string::npos || line.find("[Load]") != std::string::npos)
+                                lineColor = Color3(0.4f, 1.0f, 0.4f);
+
+                            g_Renderer.DrawText2D(line, 10.0f, textY, 15, lineColor, 0.0f);
+                            textY += lineH;
+                        }
+                    }
+
+                    // ── Debug HUD Overlay (F3, Play mode only) ──
+                    if (g_ShowDebugHUD && g_IsRunning) {
+                        float hudX = 10.0f;
+                        float hudY = 10.0f;
+                        float lineH = 22.0f;
+                        float textSize = 16.0f;
+                        Color3 hudColor(1.0f, 1.0f, 1.0f);
+                        Color3 hudAccent(0.6f, 1.0f, 0.6f);
+                        Color3 hudBg(0, 0, 0);
+
+                        char buf[256];
+                        float frameMs = (g_FPS > 0) ? (1000.0f / g_FPS) : 0.0f;
+
+                        // Collect all stats first so we can size the background correctly
+                        std::vector<std::pair<std::string, Color3>> lines;
+
+                        snprintf(buf, sizeof(buf), "Wavey Studio v0.11");
+                        lines.push_back({buf, hudAccent});
+
+                        snprintf(buf, sizeof(buf), "FPS: %.1f  (%.2f ms/frame)", g_FPS, frameMs);
+                        lines.push_back({buf, hudColor});
+
+                        snprintf(buf, sizeof(buf), "Window: %d x %d", vpW, vpH);
+                        lines.push_back({buf, hudColor});
+
+                        lines.push_back({"", hudColor}); // Spacer
+
+                        snprintf(buf, sizeof(buf), "Camera Pos: %.1f, %.1f, %.1f",
+                            g_Camera.GetPosition().X, g_Camera.GetPosition().Y, g_Camera.GetPosition().Z);
+                        lines.push_back({buf, hudColor});
+
+                        snprintf(buf, sizeof(buf), "Camera Target: %.1f, %.1f, %.1f",
+                            g_Camera.Target.X, g_Camera.Target.Y, g_Camera.Target.Z);
+                        lines.push_back({buf, hudColor});
+
+                        snprintf(buf, sizeof(buf), "Camera FOV: %.0f  |  Yaw: %.0f  Pitch: %.0f",
+                            g_Camera.FOV, g_Camera.Yaw, g_Camera.Pitch);
+                        lines.push_back({buf, hudColor});
+
+                        lines.push_back({"", hudColor}); // Spacer
+
+                        if (g_DevCharacter && !g_DevCharacter->IsDestroyed()) {
+                            Vector3 pPos = GetProp<Vector3>(g_DevCharacter, "Position", Vector3());
+                            snprintf(buf, sizeof(buf), "Player Pos: %.1f, %.1f, %.1f", pPos.X, pPos.Y, pPos.Z);
+                            lines.push_back({buf, hudColor});
+
+                            snprintf(buf, sizeof(buf), "Player Vel: %.1f, %.1f, %.1f",
+                                g_CharVelocity.X, g_CharVelocity.Y, g_CharVelocity.Z);
+                            lines.push_back({buf, hudColor});
+
+                            snprintf(buf, sizeof(buf), "Grounded: %s", g_CharGrounded ? "YES" : "NO");
+                            lines.push_back({buf, hudColor});
+                        } else {
+                            lines.push_back({"Player: N/A", Color3(1.0f, 0.5f, 0.5f)});
+                        }
+
+                        lines.push_back({"", hudColor}); // Spacer
+
+                        // Engine stats
+                        Instance* ws = g_GameRoot->FindFirstChild("Workspace");
+                        int partCount = 0, totalInstances = 0;
+                        if (ws) {
+                            auto desc = ws->GetDescendants();
+                            for (auto* d : desc) if (d->IsA("Part")) partCount++;
+                        }
+                        auto allDesc = g_GameRoot->GetDescendants();
+                        totalInstances = (int)allDesc.size();
+
+                        snprintf(buf, sizeof(buf), "Parts in Workspace: %d", partCount);
+                        lines.push_back({buf, hudColor});
+
+                        snprintf(buf, sizeof(buf), "Total Instances: %d", totalInstances);
+                        lines.push_back({buf, hudColor});
+
+                        lines.push_back({"", hudColor}); // Spacer
+
+                        // Memory (Windows-specific, no external deps)
+                        #ifdef _WIN32
+                        PROCESS_MEMORY_COUNTERS pmc;
+                        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+                            double memMB = (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
+                            snprintf(buf, sizeof(buf), "Memory: %.1f MB", memMB);
+                            lines.push_back({buf, hudColor});
+                        }
+                        #endif
+
+                        // Draw background sized for the content
+                        float bgW = 360.0f;
+                        float bgH = lines.size() * lineH + 10.0f;
+                        g_Renderer.DrawRect2D(hudX - 6, hudY - 6, bgW, bgH, hudBg, 0.35f);
+
+                        // Draw all lines
+                        for (auto& [text, color] : lines) {
+                            if (!text.empty()) {
+                                g_Renderer.DrawText2D(text, hudX, hudY, textSize, color, 0.0f);
+                            }
+                            hudY += lineH;
+                        }
+                    }
+
                     g_Renderer.End2D();
 
                     // Blit active scene straight to window in standalone mode
@@ -2799,6 +3397,7 @@ int main(int argc, char* argv[]) {
         // ── Cleanup ──
         lua_close(L);
         g_ScriptEditor.ClearAll();
+        g_JoltPhysics.Shutdown();
         g_Renderer.Shutdown();
         g_Icons.Shutdown();
         g_Undo.Clear();
